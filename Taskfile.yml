@@ -96,6 +96,19 @@ tasks:
   rust:native:smoke:
     desc: Construct the compact student and run one native WGPU forward pass
     cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-native -- --spec rust/config/browser-smoke.json]
+  models:bundle:
+    desc: Assemble the publishable browser model bundle (WASM runtime + any Q8/Q4 weights)
+    deps: [rust:wasm]
+    cmds:
+      - rm -rf model-bundle && mkdir -p model-bundle/rust-video
+      - cp -r public/rust-video/. model-bundle/rust-video/
+      - cp rust/config/browser-390m.json model-bundle/student-spec.json
+      - test -d artifacts/student-q8 && cp -r artifacts/student-q8 model-bundle/student-q8 || true
+      - test -d artifacts/student-q4 && cp -r artifacts/student-q4 model-bundle/student-q4 || true
+      - task: models:manifest
+  models:manifest:
+    desc: Write a content-addressed (sha256) manifest of the model bundle for browser caching
+    cmds: [node scripts/model-manifest.mjs model-bundle]
   smash:wan:
     desc: Compress Wan 2.1 1.3B with Pruna Smash
     deps: [setup:wan]
@@ -111,4 +124,4 @@ tasks:
       - mv /tmp/browser-video-lab.tar.gz browser-video-lab.tar.gz
   clean:
     desc: Remove reproducible build and cache outputs
-    cmds: [rm -rf dist .pytest_cache python/longlive_distill/__pycache__]
+    cmds: [rm -rf dist .pytest_cache python/longlive_distill/__pycache__ model-bundle model-bundle.tar.gz public/rust-video]

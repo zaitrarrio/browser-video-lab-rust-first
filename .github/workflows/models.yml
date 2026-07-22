@@ -1,0 +1,167 @@
+name: Build Models
+
+# Builds the Rust-first (PyTorch-free) browser model: the Burn/WGPU student
+# runtime compiled to WASM, plus Q8/Q4 weight bundles quantized from any
+# available checkpoint. Both the expensive Burn compile and the produced weight
+# bundles are cached so unchanged inputs are never rebuilt.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "scripts/model-manifest.mjs"
+      - ".github/workflows/models.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "scripts/model-manifest.mjs"
+      - ".github/workflows/models.yml"
+  workflow_dispatch:
+    inputs:
+      checkpoint_url:
+        description: "Optional F32 Safetensors checkpoint URL to quantize"
+        type: string
+        default: ""
+
+concurrency:
+  group: models-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Overridable at the repo/org level: a stable URL to an F32 Safetensors
+  # student checkpoint. When empty (the default), CI builds and caches the WASM
+  # runtime and skips quantization — it never fabricates weights it cannot train.
+  CHECKPOINT_URL: ${{ github.event.inputs.checkpoint_url || vars.CHECKPOINT_URL || '' }}
+
+jobs:
+  build:
+    name: Build & cache model bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Layer 1: cache the compiled Burn/WGPU dependency graph (the real time
+      # sink). Keyed on Cargo.lock via the action's default hashing.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Test model contracts & quantization
+        run: cargo test --manifest-path rust/Cargo.toml --workspace --locked
+
+      - name: Estimate student parameters
+        run: |
+          params=$(cargo run --manifest-path rust/Cargo.toml -p video-cli --locked -- \
+            estimate rust/config/browser-390m.json)
+          echo "Browser student ≈ ${params} parameters" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Native WGPU smoke forward pass
+        run: |
+          cargo run --release --manifest-path rust/Cargo.toml -p video-native --locked -- \
+            --spec rust/config/browser-smoke.json
+
+      # Layer 2: content-addressed cache of the produced weight bundle. Keyed on
+      # the Rust sources + configs + checkpoint URL, so weights are reused across
+      # runs whenever nothing that affects them changed.
+      - name: Restore weight-bundle cache
+        id: weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            public/rust-video
+            artifacts/student-q8
+            artifacts/student-q4
+          key: >-
+            weights-${{ runner.os }}-${{ hashFiles('rust/**/*.rs',
+            'rust/**/Cargo.toml', 'rust/Cargo.lock', 'rust/config/*.json') }}-${{
+            hashFiles('scripts/model-manifest.mjs') }}-ckpt-${{ env.CHECKPOINT_URL }}
+
+      - name: Build WASM browser model
+        if: steps.weights.outputs.cache-hit != 'true'
+        run: |
+          wasm-pack build rust/crates/video-web --release --target web \
+            --out-dir ../../../public/rust-video
+
+      - name: Fetch checkpoint
+        if: steps.weights.outputs.cache-hit != 'true' && env.CHECKPOINT_URL != ''
+        run: |
+          mkdir -p artifacts
+          echo "Downloading checkpoint from ${CHECKPOINT_URL}"
+          curl -fSL "$CHECKPOINT_URL" -o artifacts/student.safetensors
+
+      - name: Quantize weights (Q8 → Q4)
+        if: steps.weights.outputs.cache-hit != 'true'
+        run: |
+          if [ -f artifacts/student.safetensors ]; then
+            cargo run --release --manifest-path rust/Cargo.toml -p video-cli --locked -- \
+              quantize --input artifacts/student.safetensors --output artifacts/student-q8 --bits 8
+            cargo run --release --manifest-path rust/Cargo.toml -p video-cli --locked -- \
+              quantize --input artifacts/student.safetensors --output artifacts/student-q4 --bits 4
+          else
+            echo "::notice::No checkpoint present — WASM runtime built, weight quantization skipped."
+            echo "Set the CHECKPOINT_URL repo variable to publish Q8/Q4 bundles." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Assemble the publishable bundle from whatever weights exist.
+      - name: Assemble model bundle
+        run: |
+          mkdir -p model-bundle/rust-video
+          cp -r public/rust-video/. model-bundle/rust-video/
+          cp rust/config/browser-390m.json model-bundle/student-spec.json
+          [ -d artifacts/student-q8 ] && cp -r artifacts/student-q8 model-bundle/student-q8 || true
+          [ -d artifacts/student-q4 ] && cp -r artifacts/student-q4 model-bundle/student-q4 || true
+          node scripts/model-manifest.mjs model-bundle \
+            --release "${{ github.sha }}" --out model-bundle/models-manifest.json
+          cat model-bundle/models-manifest.json
+
+      - name: Upload model bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-bundle
+          path: model-bundle
+          if-no-files-found: error
+
+  publish:
+    name: Publish model bundle to release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-bundle
+          path: model-bundle
+      - name: Package bundle
+        run: |
+          tar -czf model-bundle.tar.gz -C model-bundle .
+          sha256sum model-bundle.tar.gz
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" model-bundle.tar.gz \
+            model-bundle/models-manifest.json --clobber

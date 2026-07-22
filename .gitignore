@@ -3,6 +3,17 @@ node_modules/
 dist/
 *.local
 *.tsbuildinfo
+coverage/
+npm-debug.log*
+*.log
+
+# Release artifacts (built by .github/workflows/release.yml)
+release/
+
+# Model build outputs (built by .github/workflows/models.yml)
+public/rust-video/
+model-bundle/
+model-bundle.tar.gz
 
 # Python
 .venv/

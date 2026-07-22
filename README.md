@@ -156,6 +156,36 @@ Consumers can then load weights from a stable release URL and pin
 `GITHUB_TOKEN` creates the tag and release. If `main` is a protected branch, allow
 the `github-actions[bot]` to push the version-bump commit (or supply a PAT).
 
+## Build models in CI & cache weights
+
+`.github/workflows/models.yml` builds the reproducible, PyTorch-free model path
+on every change under `rust/**` (and on demand via `workflow_dispatch`). It:
+
+1. Sets up Rust with the `wasm32-unknown-unknown` target and runs the workspace
+   tests, the parameter estimate, and one native WGPU smoke forward pass.
+2. Compiles the Burn/WGPU student to WebAssembly (`public/rust-video`).
+3. Quantizes an F32 Safetensors checkpoint to Q8 then Q4 bundles **when one is
+   available** — set the repo variable `CHECKPOINT_URL` (or pass one to
+   `workflow_dispatch`). With no checkpoint it builds the runtime and skips
+   quantization rather than fabricate untrained weights.
+4. Assembles a `model-bundle/` (WASM runtime + student spec + any weight
+   bundles) with a `models-manifest.json` recording each file's size and
+   SHA-256, uploads it as a build artifact, and attaches it to `v*` tag releases.
+
+**Two caching layers keep it fast:**
+
+- `Swatinem/rust-cache` caches the compiled Burn/WGPU dependency graph (the
+  dominant cost), keyed on `rust/Cargo.lock`.
+- An `actions/cache` step caches the produced weight bundle (`public/rust-video`
+  and the Q8/Q4 artifacts), keyed on a hash of the Rust sources, configs, and
+  the checkpoint URL. When nothing that affects the weights changed, the bundle
+  is restored instead of rebuilt.
+
+Locally, mirror the bundle step with `task models:bundle` (builds the WASM
+module and writes the content-addressed manifest). The SHA-256 manifest is what
+lets the browser cache weights by content hash via a service worker or the
+Origin Private File System.
+
 ## Production cautions
 
 - Configure COOP/COEP headers if using threaded WASM fallbacks.
