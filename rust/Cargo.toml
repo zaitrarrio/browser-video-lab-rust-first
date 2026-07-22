@@ -9,7 +9,10 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
-burn = { version = "0.21", features = ["train", "wgpu", "ndarray", "autodiff"] }
+# Only the wgpu backend is used (native + wasm/WebGPU). The train/autodiff/dataset
+# features are intentionally omitted: nothing uses them, and `train` drags in
+# libsqlite3-sys (C) which cannot compile for wasm32-unknown-unknown.
+burn = { version = "0.21", default-features = false, features = ["std", "wgpu"] }
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 half = { version = "2", features = ["bytemuck", "serde"] }

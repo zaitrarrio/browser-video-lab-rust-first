@@ -92,7 +92,9 @@ tasks:
     cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4]
   rust:wasm:
     desc: Build the Burn/WGPU browser module
-    cmds: [wasm-pack build rust/crates/video-web --target web --out-dir ../../../public/rust-video]
+    cmds:
+      - wasm-pack build rust/crates/video-web --target web --out-dir ../../../public/rust-video
+      - cp rust/config/browser-demo.json public/rust-video/student-spec.json
   rust:native:smoke:
     desc: Construct the compact student and run one native WGPU forward pass
     cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-native -- --spec rust/config/browser-smoke.json]

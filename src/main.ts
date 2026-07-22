@@ -1,8 +1,19 @@
 import "./style.css";
 
-type Mode = "sd" | "longlive" | "memflow";
+type Mode = "sd" | "longlive" | "memflow" | "rust";
 let mode: Mode = "sd";
 const root = document.querySelector<HTMLDivElement>("#app")!;
+
+// Resolve resources against Vite's base URL so paths stay correct when the demo
+// is served from a subpath (e.g. GitHub Pages under /<repo>/). The ONNX runtimes
+// point at the shipped `.example.json` manifest; the Rust student points at its
+// compiled wasm bundle's student spec.
+function manifestUrl(m: Mode): string {
+  const base = import.meta.env.BASE_URL;
+  return m === "rust"
+    ? `${base}rust-video/student-spec.json`
+    : `${base}models/${m}/manifest.example.json`;
+}
 
 const EXPERIMENTS: Record<Mode, {title: string; tag: string; blurb: string; contract: string}> = {
   sd: {
@@ -22,6 +33,12 @@ const EXPERIMENTS: Record<Mode, {title: string; tag: string; blurb: string; cont
     tag: "adaptive memory",
     blurb: "Prompt-conditioned retrieval over a bounded bank of historical video memories feeding the causal generator.",
     contract: "generator: noise, prompt_embeds, chunk_index, memory_values, memory_mask → latents, memory_key, memory_value",
+  },
+  rust: {
+    title: "Rust student",
+    tag: "burn · wgpu · wasm",
+    blurb: "The Burn latent-video student compiled to WebAssembly, running its denoiser directly on WebGPU — no ONNX Runtime.",
+    contract: "student: latents[1,C,1,H,W], timestep[1,1], prompt_embeds[1,S,text_width] → sample[1,C,1,H,W]",
   },
 };
 
@@ -58,11 +75,11 @@ function render() {
     <section class="card">
       <div class="mode-head"><strong>${ex.title}</strong><span class="pill">${ex.tag}</span></div>
       <p class="muted">${ex.blurb}</p>
-      <label>Model manifest URL<input id="manifest" value="/models/${mode}/manifest.json"></label>
+      <label>Model manifest URL<input id="manifest" value="${manifestUrl(mode)}"></label>
       <label><div class="lbl">Prompt</div><textarea id="prompt">A cinematic tracking shot of a silver robot walking through Austin at sunset</textarea></label>
       <div class="grid">
         <label>Seed<input id="seed" type="number" value="42"></label>
-        <label>${mode === "sd" ? "Steps" : "Chunks"}<input id="steps" type="number" value="4" min="1" max="${mode === "sd" ? 12 : 32}"></label>
+        <label>${mode === "sd" || mode === "rust" ? "Steps" : "Chunks"}<input id="steps" type="number" value="4" min="1" max="${mode === "sd" || mode === "rust" ? 12 : 32}"></label>
       </div>
       <div class="actions">
         <button id="load">Load model</button>

@@ -38,6 +38,30 @@ jobs:
       - name: Validate model manifests
         run: node scripts/check-models.mjs public/models/*/manifest.example.json
 
+      # Compile the Burn/WGPU student to wasm so the "Rust student" runtime is
+      # bundled into dist/ (Vite copies public/ verbatim). Cached to keep the
+      # Pages build fast after the first run.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - name: Build Rust student (wasm)
+        run: |
+          wasm-pack build rust/crates/video-web --release --target web \
+            --out-dir ../../../public/rust-video
+          cp rust/config/browser-demo.json public/rust-video/student-spec.json
+
       - name: Build demonstration page
         env:
           BASE_PATH: /${{ github.event.repository.name }}/
