@@ -1,8 +1,9 @@
 {
   "name": "browser-video-lab",
   "private": true,
+  "version": "0.1.0",
   "type": "module",
-  "scripts": {"dev":"vite","build":"tsc -b && vite build","test":"vitest run","typecheck":"tsc -b"},
+  "scripts": {"dev":"vite","build":"tsc -b && vite build","test":"vitest run","typecheck":"tsc -b","start":"node server/index.mjs","serve":"npm run build && node server/index.mjs"},
   "dependencies": {"@huggingface/transformers":"^3.7.2","onnxruntime-web":"^1.22.0"},
   "devDependencies": {"@types/node":"^24.0.0","typescript":"^5.8.3","vite":"^7.0.0","vitest":"^3.2.4"}
 }

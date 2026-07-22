@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level"
+        type: choice
+        default: auto
+        options: [auto, patch, minor, major]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Version & publish WASM artifacts
+    runs-on: ubuntu-latest
+    # Only run for a merged PR (not a closed-without-merge) or a manual dispatch.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Determine version bump
+        id: bump
+        env:
+          INPUT_BUMP: ${{ github.event.inputs.bump }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          bump=patch
+          if [ -n "$INPUT_BUMP" ] && [ "$INPUT_BUMP" != "auto" ]; then
+            bump="$INPUT_BUMP"
+          elif printf '%s' "$PR_LABELS" | grep -q '"release:major"'; then
+            bump=major
+          elif printf '%s' "$PR_LABELS" | grep -q '"release:minor"'; then
+            bump=minor
+          elif printf '%s' "$PR_LABELS" | grep -q '"release:patch"'; then
+            bump=patch
+          else
+            case "$PR_TITLE" in
+              *"!:"*|*"BREAKING CHANGE"*) bump=major ;;
+              feat:*|feat\(*) bump=minor ;;
+              *) bump=patch ;;
+            esac
+          fi
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Selected bump: $bump"
+
+      - name: Compute next version
+        id: version
+        env:
+          BUMP: ${{ steps.bump.outputs.bump }}
+        run: |
+          node <<'EOF'
+          const cp = require("child_process");
+          const fs = require("fs");
+          let latest = "";
+          try {
+            latest = cp.execSync('git tag --list "v*" --sort=-v:refname')
+              .toString().split("\n")[0].trim();
+          } catch {}
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const bump = process.env.BUMP;
+          let first = !latest;
+          let cur = latest ? latest.replace(/^v/, "") : (pkg.version || "0.0.0");
+          let [a, b, c] = cur.split(".").map(Number);
+          if (!first) {
+            if (bump === "major") { a++; b = 0; c = 0; }
+            else if (bump === "minor") { b++; c = 0; }
+            else { c++; }
+          }
+          const version = `${a}.${b}.${c}`;
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `version=${version}\ntag=v${version}\nfirst=${first}\n`);
+          console.log(`current=${cur} first=${first} -> ${version}`);
+          EOF
+
+      - name: Bump package version
+        run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Build demonstration page
+        run: npm run build
+
+      - name: Stage WASM release artifacts
+        run: |
+          mkdir -p release
+          cp node_modules/onnxruntime-web/dist/*.wasm release/
+          ( cd release && sha256sum *.wasm > SHA256SUMS.txt )
+          ORT_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('node_modules/onnxruntime-web/package.json','utf8')).version")" \
+          RELEASE_VERSION="${{ steps.version.outputs.version }}" \
+          node <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+          const files = fs.readdirSync("release")
+            .filter((f) => f.endsWith(".wasm"))
+            .map((f) => ({
+              name: f,
+              bytes: fs.statSync(path.join("release", f)).size,
+            }));
+          const manifest = {
+            release: process.env.RELEASE_VERSION,
+            onnxruntimeWeb: process.env.ORT_VERSION,
+            files,
+          };
+          fs.writeFileSync("release/wasm-manifest.json", JSON.stringify(manifest, null, 2));
+          console.log(manifest);
+          EOF
+          ls -lh release
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          if git diff --cached --quiet; then
+            echo "No version change to commit."
+          else
+            git commit -m "chore(release): ${{ steps.version.outputs.tag }} [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            release/*.wasm release/SHA256SUMS.txt release/wasm-manifest.json

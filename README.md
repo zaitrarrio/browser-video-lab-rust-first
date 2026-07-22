@@ -106,6 +106,56 @@ npm run build
 node scripts/check-models.mjs public/models/*/manifest.example.json
 ```
 
+## Deploy the demonstration page
+
+The demo builds to a static `dist/` bundle served by a zero-dependency Node server
+(`server/index.mjs`) that sets the COOP/COEP headers WebGPU threading requires and
+supports HTTP byte-range requests for large model files.
+
+Locally:
+
+```bash
+npm run serve          # build, then serve dist/ on http://localhost:8080
+npm start              # serve an existing dist/ (set PORT/STATIC_ROOT to override)
+```
+
+**Railway.** `railway.json` builds the multi-stage `Dockerfile` (typecheck + test +
+build → runtime that serves `dist/`) and health-checks `/healthz`. Deploy with
+`railway up`, or let CI handle it:
+
+```bash
+railway up            # from a linked project, or
+docker build -t browser-video-lab . && docker run -p 8080:8080 browser-video-lab
+```
+
+**GitHub Actions.** `.github/workflows/deploy.yml` runs the full check suite
+(`typecheck`, `test`, model-manifest validation, `build`) on every push and PR, then
+deploys `main` to Railway. Configure these repository settings:
+
+- Secret `RAILWAY_TOKEN` — a Railway project/account token.
+- Variables `RAILWAY_SERVICE` (defaults to `browser-video-lab`) and optionally
+  `RAILWAY_PUBLIC_URL` for the deployment environment link.
+
+## Releases & WASM artifacts
+
+`.github/workflows/release.yml` versions and releases automatically **when a pull
+request is merged into `main`** (or via manual `workflow_dispatch`). It:
+
+1. Picks the bump level — a `release:major` / `release:minor` / `release:patch` PR
+   label wins; otherwise the PR title's conventional-commit prefix decides
+   (`feat:` → minor, `!:` / `BREAKING CHANGE` → major, everything else → patch).
+2. Computes the next semver from the latest `v*` tag (the first release publishes
+   the current `package.json` version as-is), bumps `package.json`, and commits it
+   back to `main` as `chore(release): vX.Y.Z [skip ci]`.
+3. Builds the page, then publishes the ONNX Runtime Web `.wasm` binaries from
+   `onnxruntime-web/dist` as **release assets**, alongside `SHA256SUMS.txt` and a
+   `wasm-manifest.json` recording the release and `onnxruntime-web` versions.
+
+Consumers can then load weights from a stable release URL and pin
+`ort.env.wasm.wasmPaths` to it. No secrets are required — the built-in
+`GITHUB_TOKEN` creates the tag and release. If `main` is a protected branch, allow
+the `github-actions[bot]` to push the version-bump commit (or supply a PAT).
+
 ## Production cautions
 
 - Configure COOP/COEP headers if using threaded WASM fallbacks.
