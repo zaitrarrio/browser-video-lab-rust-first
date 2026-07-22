@@ -1,0 +1,8 @@
+{
+  "name": "browser-video-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {"dev":"vite","build":"tsc -b && vite build","test":"vitest run","typecheck":"tsc -b"},
+  "dependencies": {"@huggingface/transformers":"^3.7.2","onnxruntime-web":"^1.22.0"},
+  "devDependencies": {"@types/node":"^24.0.0","typescript":"^5.8.3","vite":"^7.0.0","vitest":"^3.2.4"}
+}

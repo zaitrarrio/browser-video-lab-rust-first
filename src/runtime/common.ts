@@ -1,0 +1,7 @@
+import * as ort from "onnxruntime-web/webgpu";
+export type Manifest={kind:"sd-turbo"|"longlive"|"memflow";width:number;height:number;latentScale:number;models:Record<string,string>;io?:Record<string,string>;scheduler?:{trainSteps:number};memory?:{capacity:number;topK:number;keySize:number}};
+export async function manifest(url:string){const r=await fetch(url);if(!r.ok)throw new Error(`Manifest ${r.status}: ${url}`);const m=await r.json() as Manifest;const base=new URL(url,location.href);for(const k of Object.keys(m.models))m.models[k]=new URL(m.models[k],base).href;return m}
+export async function session(url:string){return ort.InferenceSession.create(url,{executionProviders:["webgpu"],graphOptimizationLevel:"all",enableMemPattern:false})}
+export function normal(size:number,seed:number){let s=seed>>>0;const out=new Float32Array(size);for(let i=0;i<size;i+=2){s=(1664525*s+1013904223)>>>0;const u=(s+1)/4294967297;s=(1664525*s+1013904223)>>>0;const v=(s+1)/4294967297;const r=Math.sqrt(-2*Math.log(u));out[i]=r*Math.cos(2*Math.PI*v);if(i+1<size)out[i+1]=r*Math.sin(2*Math.PI*v)}return out}
+export function rgbaFromNchw(data:Float32Array,w:number,h:number){const o=new Uint8ClampedArray(w*h*4),plane=w*h;for(let i=0;i<plane;i++){o[i*4]=255*Math.max(0,Math.min(1,data[i]/2+.5));o[i*4+1]=255*Math.max(0,Math.min(1,data[plane+i]/2+.5));o[i*4+2]=255*Math.max(0,Math.min(1,data[2*plane+i]/2+.5));o[i*4+3]=255}return o}
+export {ort};

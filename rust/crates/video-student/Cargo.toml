@@ -1,0 +1,10 @@
+[package]
+name = "video-student"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+burn.workspace = true
+serde.workspace = true
+video-contract = { path = "../video-contract" }
+

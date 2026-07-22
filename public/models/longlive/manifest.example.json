@@ -1,0 +1,1 @@
+{"kind":"longlive","width":480,"height":272,"latentScale":0.18215,"models":{"tokenizer":"google/umt5-small","text_encoder":"./text_encoder/model.onnx","generator":"./generator/model.onnx","vae_decoder":"./vae_decoder/model.onnx"}}

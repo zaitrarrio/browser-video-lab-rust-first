@@ -1,0 +1,114 @@
+version: '3'
+
+vars:
+  PYTHON: '{{default ".venv/bin/python" .PYTHON}}'
+  NPM_CACHE: '{{default "/tmp/npm-cache" .NPM_CACHE}}'
+  DISTILL_CONFIG: '{{default "python/longlive_distill/configs/browser-384m.yaml" .DISTILL_CONFIG}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds: [task --list]
+  setup:
+    desc: Install browser dependencies
+    cmds: [npm install --cache {{.NPM_CACHE}} --ignore-scripts]
+    sources: [package.json, package-lock.json]
+    generates: [node_modules/.package-lock.json]
+  setup:python:
+    desc: Create the base Python environment
+    cmds:
+      - python3 -m venv .venv
+      - '{{.PYTHON}} -m pip install --upgrade pip'
+      - '{{.PYTHON}} -m pip install -r python/requirements-distill.txt'
+    generates: [.venv/bin/python]
+  setup:wan:
+    desc: Install Wan and Pruna dependencies into the Python environment
+    deps: [setup:python]
+    cmds: ['{{.PYTHON}} -m pip install -r python/requirements-wan.txt']
+  setup:rust:
+    desc: Install Rust with rustup when cargo is unavailable
+    cmds:
+      - command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - rustup target add wasm32-unknown-unknown
+      - command -v wasm-pack >/dev/null || cargo install wasm-pack --locked
+  dev:
+    desc: Start the WebGPU browser application
+    deps: [setup]
+    cmds: [npm run dev]
+  check:
+    desc: Run every local non-GPU validation
+    deps: [typecheck, test, build, check:models, check:python]
+  typecheck:
+    cmds: [npm run typecheck]
+  test:
+    cmds: [npm test]
+  build:
+    cmds: [npm run build]
+  check:models:
+    cmds: [node scripts/check-models.mjs public/models/*/manifest.example.json]
+  check:python:
+    cmds: [python3 -m compileall -q python]
+  distill:smoke:
+    desc: Exercise the complete distillation loop with tiny synthetic models
+    deps: [setup:python]
+    cmds: ['{{.PYTHON}} -m longlive_distill.train --config python/longlive_distill/configs/smoke.yaml']
+    env: {PYTHONPATH: python}
+  distill:
+    desc: Distill a configured LongLive teacher into the browser student
+    deps: [setup:python]
+    cmds: ['{{.PYTHON}} -m longlive_distill.train --config {{.DISTILL_CONFIG}}']
+    env: {PYTHONPATH: python}
+  distill:export:
+    desc: Export a distilled browser student to ONNX
+    deps: [setup:python]
+    requires: {vars: [CHECKPOINT]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.export --config {{.DISTILL_CONFIG}} --checkpoint {{.CHECKPOINT}} --output artifacts/longlive-browser/denoiser.onnx']
+    env: {PYTHONPATH: python}
+  teacher:cache:
+    desc: Run the optional official LongLive teacher once and create framework-neutral Safetensors shards
+    deps: [setup:python]
+    requires: {vars: [TEACHER_ADAPTER, DATASET]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.cache_teacher --adapter {{.TEACHER_ADAPTER}} --dataset {{.DATASET}} --output data/teacher-cache {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
+  rust:check:
+    desc: Type-check the Rust-first workspace
+    cmds: [cargo check --manifest-path rust/Cargo.toml --workspace]
+  rust:test:
+    desc: Test contracts, model utilities, and quantization
+    cmds: [cargo test --manifest-path rust/Cargo.toml --workspace]
+  rust:estimate:
+    desc: Print the approximate browser-student parameter count
+    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- estimate --spec rust/config/browser-390m.json]
+  rust:validate-cache:
+    desc: Validate framework-neutral teacher shards
+    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache --path data/teacher-cache]
+  rust:quantize:
+    desc: Convert F32 Safetensors weights to the shared Q8 bundle
+    requires: {vars: [CHECKPOINT]}
+    cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8]
+  rust:quantize:q4:
+    desc: Create Q4 weights after the Q8 quality gate passes
+    requires: {vars: [CHECKPOINT]}
+    cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4]
+  rust:wasm:
+    desc: Build the Burn/WGPU browser module
+    cmds: [wasm-pack build rust/crates/video-web --target web --out-dir ../../../public/rust-video]
+  rust:native:smoke:
+    desc: Construct the compact student and run one native WGPU forward pass
+    cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-native -- --spec rust/config/browser-smoke.json]
+  smash:wan:
+    desc: Compress Wan 2.1 1.3B with Pruna Smash
+    deps: [setup:wan]
+    cmds: ['{{.PYTHON}} python/smash_wan21.py {{.CLI_ARGS}}']
+  benchmark:wan:
+    desc: Benchmark a compressed Wan model; pass its path after --
+    deps: [setup:wan]
+    cmds: ['{{.PYTHON}} python/benchmark_wan21.py {{.CLI_ARGS}}']
+  package:
+    desc: Build the source archive
+    cmds:
+      - tar --exclude='__pycache__' --exclude='target' -czf /tmp/browser-video-lab.tar.gz README.md Taskfile.yml package.json package-lock.json tsconfig.json vite.config.ts index.html src public python rust scripts .gitignore
+      - mv /tmp/browser-video-lab.tar.gz browser-video-lab.tar.gz
+  clean:
+    desc: Remove reproducible build and cache outputs
+    cmds: [rm -rf dist .pytest_cache python/longlive_distill/__pycache__]

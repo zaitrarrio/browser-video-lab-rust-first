@@ -1,0 +1,14 @@
+[package]
+name = "video-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[dependencies]
+burn.workspace = true
+serde_json.workspace = true
+video-contract = { path = "../video-contract" }
+video-student = { path = "../video-student" }
+wasm-bindgen.workspace = true
+

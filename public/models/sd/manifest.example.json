@@ -1,0 +1,1 @@
+{"kind":"sd-turbo","width":512,"height":512,"latentScale":0.18215,"scheduler":{"trainSteps":1000},"models":{"tokenizer":"stabilityai/sd-turbo","text_encoder":"./text_encoder/model.onnx","unet":"./unet/model.onnx","vae_decoder":"./vae_decoder/model.onnx"}}

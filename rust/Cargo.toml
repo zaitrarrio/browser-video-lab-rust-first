@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/video-contract", "crates/video-student", "crates/video-cli", "crates/video-native", "crates/video-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+burn = { version = "0.21", features = ["train", "wgpu", "ndarray", "autodiff"] }
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+half = { version = "2", features = ["bytemuck", "serde"] }
+safetensors = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+wasm-bindgen = "0.2"

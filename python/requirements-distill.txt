@@ -1,0 +1,5 @@
+torch>=2.4
+numpy>=2.0
+PyYAML>=6.0
+onnx>=1.17
+safetensors>=0.5
