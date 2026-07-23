@@ -1,0 +1,25 @@
+[package]
+name = "video-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only distillation trainer. Deliberately NOT a dependency of video-web:
+# autodiff (and any future cuda feature) must never enter the wasm graph.
+[dependencies]
+anyhow.workspace = true
+burn = { workspace = true, features = ["autodiff", "ndarray"] }
+clap.workspace = true
+half.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+video-contract = { path = "../video-contract" }
+video-student = { path = "../video-student" }
+
+[features]
+# Production NVIDIA path (e.g. a Colab session): cargo run -p video-train --features cuda --release
+cuda = ["burn/cuda"]
+
+[dev-dependencies]
+tempfile = "3"

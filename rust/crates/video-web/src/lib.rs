@@ -1,5 +1,7 @@
 use burn::backend::wgpu::{graphics::WebGpu, init_setup_async, RuntimeOptions, WgpuDevice};
 use burn::backend::Wgpu;
+use burn::module::Module;
+use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::Tensor;
 use video_contract::StudentSpec;
 use video_student::BrowserVideoStudent;
@@ -36,6 +38,7 @@ impl Lcg {
 pub struct BrowserModel {
     spec: StudentSpec,
     model: Option<BrowserVideoStudent<Wgpu>>,
+    trained: bool,
 }
 
 #[wasm_bindgen]
@@ -47,7 +50,7 @@ impl BrowserModel {
     pub fn new(spec_json: &str) -> Result<BrowserModel, JsError> {
         let spec: StudentSpec = serde_json::from_str(spec_json)?;
         spec.validate().map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(Self { spec, model: None })
+        Ok(Self { spec, model: None, trained: false })
     }
 
     /// Acquire the WebGPU device and instantiate the Burn student. Async because
@@ -56,7 +59,28 @@ impl BrowserModel {
         let device = WgpuDevice::default();
         init_setup_async::<WebGpu>(&device, RuntimeOptions::default()).await;
         self.model = Some(BrowserVideoStudent::new(self.spec.clone(), &device));
+        self.trained = false;
         Ok(())
+    }
+
+    /// Like [`prepare`], but loads trained weights from a `student.bin` record
+    /// produced by `video-train` (BinFileRecorder, full precision). The record's
+    /// shapes must match the spec this model was constructed with.
+    pub async fn prepare_with_weights(&mut self, weights: &[u8]) -> Result<(), JsError> {
+        let device = WgpuDevice::default();
+        init_setup_async::<WebGpu>(&device, RuntimeOptions::default()).await;
+        let model = BrowserVideoStudent::new(self.spec.clone(), &device);
+        let record = BinBytesRecorder::<FullPrecisionSettings>::default()
+            .load(weights.to_vec(), &device)
+            .map_err(|e| JsError::new(&format!("weight record: {e:?}")))?;
+        self.model = Some(model.load_record(record));
+        self.trained = true;
+        Ok(())
+    }
+
+    /// Whether the current model carries trained weights (vs random init).
+    pub fn trained(&self) -> bool {
+        self.trained
     }
 
     pub fn backend(&self) -> String {

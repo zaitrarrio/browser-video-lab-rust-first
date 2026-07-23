@@ -101,6 +101,7 @@ jobs:
         run: |
           wasm-pack build rust/crates/video-web --release --target web \
             --out-dir ../../../public/rust-video
+          cp rust/config/browser-demo.json public/rust-video/student-spec.json
 
       - name: Fetch checkpoint
         if: steps.weights.outputs.cache-hit != 'true' && env.CHECKPOINT_URL != ''

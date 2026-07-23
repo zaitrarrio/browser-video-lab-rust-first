@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/video-contract", "crates/video-student", "crates/video-cli", "crates/video-native", "crates/video-web"]
+members = ["crates/video-contract", "crates/video-student", "crates/video-cli", "crates/video-native", "crates/video-train", "crates/video-web"]
 
 [workspace.package]
 version = "0.1.0"

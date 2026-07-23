@@ -11,6 +11,8 @@ serde_json.workspace = true
 video-contract = { path = "../video-contract" }
 video-student = { path = "../video-student" }
 wasm-bindgen.workspace = true
+# Required by wasm-bindgen's generated glue for `async fn` exports.
+wasm-bindgen-futures = "0.4"
 
 # Enable getrandom's browser backend for the wasm target (see ../../.cargo/config.toml).
 [target.'cfg(target_arch = "wasm32")'.dependencies]

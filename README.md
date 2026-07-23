@@ -1,13 +1,14 @@
 # Browser Video Lab
 
-Four related experiments in one project:
+Five related experiments in one project:
 
 1. **SD-Turbo WebGPU** — browser-side text encoding, denoising and VAE decoding using ONNX Runtime Web.
 2. **LongLive WebGPU** — a streaming, causal browser runtime with persistent KV cache for an externally exported LongLive graph.
 3. **MemFlow WebGPU** — prompt-conditioned adaptive retrieval over a bounded bank of historical video memories.
-4. **Wan 2.1 + Pruna Smash** — native CUDA compression, persistence and benchmarking for `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
+4. **Rust student (Burn · WGPU · WASM)** — the Burn latent-video student compiled to WebAssembly, running its denoiser directly on WebGPU with no ONNX Runtime. See [Rust-first edition](#rust-first-edition).
+5. **Wan 2.1 + Pruna Smash** — native CUDA compression, persistence and benchmarking for `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
 
-The browser runtimes do not download multi-gigabyte weights with the repository. Put exported ONNX models under `public/models`, then copy each `manifest.example.json` to `manifest.json`. Large ONNX files should be hosted with byte-range support in production.
+The three ONNX browser runtimes do not download multi-gigabyte weights with the repository. Put exported ONNX models under `public/models`, then copy each `manifest.example.json` to `manifest.json` (the interactive UI defaults to the shipped `manifest.example.json` so it loads out of the box). Large ONNX files should be hosted with byte-range support in production. The Rust student needs no ONNX export — build it with `task rust:wasm` (outputs to `public/rust-video/`).
 
 ## Browser app
 
@@ -80,6 +81,21 @@ task distill:export CHECKPOINT=artifacts/longlive-browser-384m/student.pt
 
 The initial export is a timestep-conditioned `denoiser.onnx`; it is intentionally not copied over the browser's causal `generator.onnx`. Recommended progression is 390M BF16 teacher matching, then few-step/DMD tuning, then packaging the distilled sampler behind the browser generator contract, INT8 validation, and only then INT4 weight quantization for WebGPU. The smoke configuration uses synthetic tensors solely to validate the optimizer and export plumbing; production training requires real VAE latents and text embeddings.
 
+### Prompt conditioning for the browser (umt5-small)
+
+The teacher conditions on T5-XXL (4096-dim) embeddings, which cannot run in a browser tab. To keep real free-text prompting, the browser student is distilled to condition on **umt5-small** (512-dim) — the same encoder the LongLive/MemFlow runtimes already tokenize with — while the teacher keeps its own 4096-dim conditioning. The student's `text` input Linear (`text_width` → `width`) *is* the learned projection, so no extra module is required; set `text_width: 512` (see `configs/browser-384m-umt5.yaml`).
+
+This couples the data pipeline: each `.pt` shard must carry both `prompt_embeds` (`[1,128,4096]`, teacher) and `student_prompt_embeds` (`[1,128,512]`, umt5-small) for the same caption. `train.py` routes each to its model; shards without `student_prompt_embeds` fall back to the teacher embeddings. Quality caveat: umt5-small is a much weaker text encoder than T5-XXL, so prompt adherence will trail the teacher — the accepted trade-off for running entirely in-browser.
+
+```bash
+task distill DISTILL_CONFIG=python/longlive_distill/configs/browser-384m-umt5.yaml
+task onnx:student CHECKPOINT=artifacts/longlive-browser-umt5/student.pt DISTILL_CONFIG=python/longlive_distill/configs/browser-384m-umt5.yaml
+# Export the matching umt5-small encoder into the same folder (needs `optimum`):
+#   optimum-cli export onnx --model google/umt5-small --task feature-extraction public/models/onnx/text_encoder
+```
+
+At inference the `onnx-student` runtime tokenizes the prompt, runs `text_encoder/model.onnx`, and feeds `last_hidden_state` straight into `denoiser.onnx`. Until a `text_encoder` is shipped in the manifest it falls back to seeded embeddings so the tab still works.
+
 ## Task automation
 
 Install [Task](https://taskfile.dev/), then run `task --list`. The Taskfile covers dependency setup, browser development, all checks, distillation smoke/production/export, Wan Smash and benchmarking, packaging, and reproducible-output cleanup.
@@ -94,6 +110,10 @@ The `rust/` workspace implements the PyTorch-free recurring path:
 - Native WGPU and WASM/WebGPU model construction
 - Shared Q8 and packed Q4 weight bundles
 - Parameter estimation and teacher-cache validation tools
+
+The `video-web` crate exposes the student to the browser via `wasm-bindgen`: `new BrowserModel(specJson)`, `await model.prepare()` (acquires the WebGPU adapter and instantiates the Burn model), then `model.generate(seed, steps, side)` runs the denoiser and returns an RGBA frame. `task rust:wasm` compiles it with `wasm-pack --target web` into `public/rust-video/` (plus a compact `student-spec.json`), which the "Rust student" runtime in `src/runtime/rust-video.ts` dynamically imports. The published 390M spec (`rust/config/browser-390m.json`) is intended for native/quantized bundles; the in-tab demo uses the light `rust/config/browser-demo.json`.
+
+> Wasm build note: the workspace pins `burn` to `default-features = false, features = ["std", "wgpu"]` — the `train` feature drags in `libsqlite3-sys` (C), which cannot compile for `wasm32-unknown-unknown`. `getrandom`'s browser backend is enabled via `rust/.cargo/config.toml`.
 
 PyTorch is now isolated to the optional `task teacher:cache` bridge and Pruna's Wan compressor. Once teacher shards exist, student development and deployment can be Rust-only. See `rust/README.md` for the artifact contracts and progression.
 

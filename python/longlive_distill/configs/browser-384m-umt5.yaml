@@ -1,0 +1,30 @@
+# Browser-deployable student distilled to condition on a small, in-browser text
+# encoder (umt5-small, 512-dim) instead of the teacher's T5-XXL (4096-dim), which
+# cannot run in a tab. The teacher still sees its own 4096-dim embeddings; the
+# student sees umt5-small embeddings of the SAME caption and learns to reproduce
+# the teacher's denoising response. Its `text` input Linear (512 -> width) is the
+# learned projection — no separate module is needed.
+#
+# Data contract: each `.pt` shard in data.path must carry BOTH
+#   prompt_embeds          [1, 128, 4096]  # teacher conditioning (T5-XXL)
+#   student_prompt_embeds  [1, 128, 512]   # student conditioning (umt5-small)
+# for the SAME caption. Without student_prompt_embeds the loader falls back to
+# prompt_embeds (only valid when both encoders share a width).
+teacher:
+  # Replace with an adapter that loads LongLive-1.3B and returns noise_pred + hidden_states.
+  factory: longlive_teacher_adapter:build_teacher
+  checkpoint: models/LongLive-1.3B/model.pt
+  strict: true
+  model: {repo: vendor/LongLive, config: configs/inference.yaml}
+student:
+  factory: builtin:student
+  # text_width=512 matches umt5-small's hidden size; tune width/layers after
+  # measuring the exported graph against the ~390M budget.
+  model: {latent_channels: 4, text_width: 512, width: 1152, layers: 24, heads: 16, mlp_ratio: 4}
+data:
+  path: data/longlive-latents
+  latent_shape: [1, 4, 4, 32, 48]
+  text_shape: [1, 128, 4096]         # teacher conditioning (T5-XXL)
+  student_text_shape: [1, 128, 512]  # student conditioning (umt5-small)
+loss: {output: 1.0, temporal: 0.3, feature: 0.05}
+training: {device: cuda, bf16: true, steps: 100000, lr: 0.00002, weight_decay: 0.01, grad_clip: 1.0, log_every: 10, output: artifacts/longlive-browser-umt5}

@@ -1,6 +1,8 @@
 import "./style.css";
 
-type Mode = "sd" | "longlive" | "memflow" | "rust";
+type Mode = "sd" | "longlive" | "memflow" | "onnx" | "rust";
+// Modes whose second control is a diffusion step count (rather than a chunk count).
+const STEP_MODES: Mode[] = ["sd", "onnx", "rust"];
 let mode: Mode = "sd";
 const root = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -33,6 +35,12 @@ const EXPERIMENTS: Record<Mode, {title: string; tag: string; blurb: string; cont
     tag: "adaptive memory",
     blurb: "Prompt-conditioned retrieval over a bounded bank of historical video memories feeding the causal generator.",
     contract: "generator: noise, prompt_embeds, chunk_index, memory_values, memory_mask → latents, memory_key, memory_value",
+  },
+  onnx: {
+    title: "ONNX student",
+    tag: "distilled · ort-web",
+    blurb: "The distilled latent-video student's denoiser.onnx run on ONNX Runtime Web over WebGPU — the path that carries real trained weights into the browser. First three latent channels are shown directly (no VAE exported yet).",
+    contract: "denoiser: noisy_latents[1,C,1,H,W], timestep[1], prompt_embeds[1,S,text_width] → noise_pred[1,C,1,H,W]",
   },
   rust: {
     title: "Rust student",
@@ -79,7 +87,7 @@ function render() {
       <label><div class="lbl">Prompt</div><textarea id="prompt">A cinematic tracking shot of a silver robot walking through Austin at sunset</textarea></label>
       <div class="grid">
         <label>Seed<input id="seed" type="number" value="42"></label>
-        <label>${mode === "sd" || mode === "rust" ? "Steps" : "Chunks"}<input id="steps" type="number" value="4" min="1" max="${mode === "sd" || mode === "rust" ? 12 : 32}"></label>
+        <label>${STEP_MODES.includes(mode) ? "Steps" : "Chunks"}<input id="steps" type="number" value="4" min="1" max="${STEP_MODES.includes(mode) ? 12 : 32}"></label>
       </div>
       <div class="actions">
         <button id="load">Load model</button>

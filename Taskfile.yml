@@ -4,6 +4,8 @@ vars:
   PYTHON: '{{default ".venv/bin/python" .PYTHON}}'
   NPM_CACHE: '{{default "/tmp/npm-cache" .NPM_CACHE}}'
   DISTILL_CONFIG: '{{default "python/longlive_distill/configs/browser-384m.yaml" .DISTILL_CONFIG}}'
+  TRAIN_SPEC: '{{default "rust/config/browser-390m-umt5.json" .TRAIN_SPEC}}'
+  TRAIN_OUT: '{{default "artifacts/longlive-browser-burn" .TRAIN_OUT}}'
 
 tasks:
   default:
@@ -70,6 +72,14 @@ tasks:
     requires: {vars: [TEACHER_ADAPTER, DATASET]}
     cmds: ['{{.PYTHON}} -m longlive_distill.cache_teacher --adapter {{.TEACHER_ADAPTER}} --dataset {{.DATASET}} --output data/teacher-cache {{.CLI_ARGS}}']
     env: {PYTHONPATH: python}
+  onnx:student:
+    desc: Export the distilled student to public/models/onnx for the ONNX Runtime Web demo
+    deps: [setup:python]
+    requires: {vars: [CHECKPOINT]}
+    cmds:
+      - '{{.PYTHON}} -m longlive_distill.export --config {{.DISTILL_CONFIG}} --checkpoint {{.CHECKPOINT}} --output public/models/onnx/denoiser.onnx'
+      - cp public/models/onnx/manifest.example.json public/models/onnx/manifest.json
+    env: {PYTHONPATH: python}
   rust:check:
     desc: Type-check the Rust-first workspace
     cmds: [cargo check --manifest-path rust/Cargo.toml --workspace]
@@ -98,6 +108,21 @@ tasks:
   rust:native:smoke:
     desc: Construct the compact student and run one native WGPU forward pass
     cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-native -- --spec rust/config/browser-smoke.json]
+  rust:train:smoke:
+    desc: Prove the PyTorch-free training loop end-to-end on CPU (synthetic cache → train → student.bin)
+    cmds:
+      - cargo run --manifest-path rust/Cargo.toml -p video-train -- synth-cache --spec rust/config/browser-smoke.json --output artifacts/synth-cache --shards 2 --frames 2 --height 4 --width 4 --seq 4 --teacher-text-width 32 --relation-layers 1
+      - cargo run --manifest-path rust/Cargo.toml -p video-train -- train --spec rust/config/browser-smoke.json --cache artifacts/synth-cache --output artifacts/train-smoke --backend ndarray --steps 10 --lr 0.01 --log-every 2
+  rust:train:
+    desc: Distill the browser student from a real teacher cache, PyTorch-free. Pass extra flags after --
+    requires: {vars: [CACHE]}
+    cmds:
+      - cargo run --release --manifest-path rust/Cargo.toml -p video-train -- train --spec {{.TRAIN_SPEC}} --cache {{.CACHE}} --output {{.TRAIN_OUT}} {{.CLI_ARGS}}
+  rust:weights:
+    desc: Install trained Burn weights (and their matching spec) into the demo bundle
+    cmds:
+      - cp {{.TRAIN_OUT}}/student.bin public/rust-video/student.bin
+      - cp {{.TRAIN_SPEC}} public/rust-video/student-spec.json
   models:bundle:
     desc: Assemble the publishable browser model bundle (WASM runtime + any Q8/Q4 weights)
     deps: [rust:wasm]
@@ -107,6 +132,7 @@ tasks:
       - cp rust/config/browser-390m.json model-bundle/student-spec.json
       - test -d artifacts/student-q8 && cp -r artifacts/student-q8 model-bundle/student-q8 || true
       - test -d artifacts/student-q4 && cp -r artifacts/student-q4 model-bundle/student-q4 || true
+      - test -f {{.TRAIN_OUT}}/student.bin && cp {{.TRAIN_OUT}}/student.bin model-bundle/rust-video/student.bin && cp {{.TRAIN_SPEC}} model-bundle/rust-video/student-spec.json || true
       - task: models:manifest
   models:manifest:
     desc: Write a content-addressed (sha256) manifest of the model bundle for browser caching

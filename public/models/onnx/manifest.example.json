@@ -1,0 +1,1 @@
+{"kind":"student","width":48,"height":48,"latentScale":1,"scheduler":{"trainSteps":1000},"latent":{"channels":4,"frames":4,"seq":128,"text_width":512},"tokenizer":"google/umt5-small","models":{"tokenizer":"google/umt5-small","text_encoder":"./text_encoder/model.onnx","denoiser":"./denoiser.onnx"}}

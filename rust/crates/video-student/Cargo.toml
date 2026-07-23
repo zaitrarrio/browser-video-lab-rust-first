@@ -8,3 +8,7 @@ burn.workspace = true
 serde.workspace = true
 video-contract = { path = "../video-contract" }
 
+# CPU backend for unit tests only (the crate ships the wgpu backend to wasm).
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+

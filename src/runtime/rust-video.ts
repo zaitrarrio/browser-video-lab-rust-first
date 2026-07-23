@@ -25,6 +25,8 @@ type WasmModule = {
   default: (init?: unknown) => Promise<unknown>;
   BrowserModel: new (specJson: string) => {
     prepare(): Promise<void>;
+    prepare_with_weights(weights: Uint8Array): Promise<void>;
+    trained(): boolean;
     generate(seed: number, steps: number, side: number): Promise<Uint8Array>;
     backend(): string;
     parameters(): number;
@@ -51,9 +53,22 @@ export class RustVideoRuntime {
 
     this.model = new mod.BrowserModel(JSON.stringify(spec));
     progress("Acquiring WebGPU adapter…");
-    await this.model.prepare();
+    // Load trained weights (a video-train BinFileRecorder record) when the
+    // bundle ships them; otherwise fall back to random init so the demo still
+    // runs. The status line always says which one the user is looking at.
+    let loaded = false;
+    try {
+      const wr = await fetch(`${base}rust-video/student.bin`);
+      if (wr.ok && !(wr.headers.get("content-type") ?? "").includes("text/html")) {
+        await this.model.prepare_with_weights(new Uint8Array(await wr.arrayBuffer()));
+        loaded = true;
+      }
+    } catch {
+      /* fall through to random init */
+    }
+    if (!loaded) await this.model.prepare();
     const params = Math.round(this.model.parameters() / 1e6);
-    progress(`Rust student ready · ${this.model.backend()} · ~${params}M params`);
+    progress(`Rust student ready · ${this.model.backend()} · ~${params}M params · ${loaded ? "trained weights" : "random init"}`);
   }
 
   async run(
