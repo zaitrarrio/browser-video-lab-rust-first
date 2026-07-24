@@ -1,0 +1,128 @@
+name: Train Student
+
+# Distills the browser student on Kaggle's free GPU, one resumable chunk per run.
+#
+# Each run trains until it exhausts its step budget or its wall clock, versions
+# the checkpoint back to a Kaggle dataset, and reports progress. The cron simply
+# fires again; the trainer picks up from the exact step it stopped at, so a
+# 200k-step run crosses as many 12h sessions as it needs without supervision.
+#
+# Free-tier budget: Kaggle grants ~30 GPU-hours/week, so three ~9h chunks a week
+# is the most a run can safely draw. Overrunning the quota queues the kernel
+# rather than failing it, but the schedule below stays inside it deliberately.
+#
+# One-time setup before this can run — see kaggle/README.md:
+#   - repo secrets KAGGLE_USERNAME and KAGGLE_KEY (from kaggle.json)
+#   - the same two values added as *Kaggle* notebook secrets, so the kernel can
+#     version its own datasets without shipping multi-GB weights through CI
+#   - a teacher-cache dataset populated once, unless you opt into synthetic data
+
+on:
+  schedule:
+    # Mon/Wed/Fri 02:00 UTC — three chunks a week, inside the free GPU quota.
+    - cron: "0 2 * * 1,3,5"
+  workflow_dispatch:
+    inputs:
+      chunk_steps:
+        description: "Steps to run in this chunk"
+        type: string
+        default: "20000"
+      target_steps:
+        description: "Total steps for the whole run"
+        type: string
+        default: "200000"
+      allow_synthetic_teacher:
+        description: "Train on synthetic tensors when no teacher cache exists (plumbing only — produces a running student, never a good one)"
+        type: boolean
+        default: false
+
+# Never let two chunks train concurrently: they would race on the same
+# checkpoint dataset and one would silently overwrite the other's progress.
+concurrency:
+  group: train-student
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  chunk:
+    name: Train one chunk on Kaggle GPU
+    runs-on: ubuntu-latest
+    # 12h session + push/poll overhead. GitHub caps a job at 6h, so the
+    # orchestrator's own session_seconds is what actually bounds the kernel;
+    # this only bounds how long we sit watching it.
+    timeout-minutes: 350
+    outputs:
+      completed: ${{ steps.train.outputs.completed }}
+      steps_done: ${{ steps.train.outputs.steps_done }}
+      checkpoint_dataset: ${{ steps.train.outputs.checkpoint_dataset }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: pipx install kaggle
+
+      - name: Launch training chunk
+        id: train
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}
+          CHUNK_STEPS: ${{ github.event.inputs.chunk_steps || vars.CHUNK_STEPS || '20000' }}
+          TARGET_STEPS: ${{ github.event.inputs.target_steps || vars.TARGET_STEPS || '200000' }}
+          ALLOW_SYNTHETIC_TEACHER: ${{ github.event.inputs.allow_synthetic_teacher || 'false' }}
+        run: node scripts/kaggle-orchestrate.mjs
+
+  promote:
+    name: Publish finished weights
+    needs: chunk
+    if: needs.chunk.outputs.completed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pipx install kaggle
+
+      # The run is done: pull the final Burn record out of the checkpoint cache
+      # and publish it at a stable URL. `models.yml` and the demo bundle consume
+      # `student.bin` + its spec exactly as `task rust:weights` does locally.
+      - name: Fetch final checkpoint
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          kaggle datasets download -d "${{ needs.chunk.outputs.checkpoint_dataset }}" -p ckpt --unzip
+          cp "${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}" ckpt/student-spec.json
+          ls -la ckpt
+          test -s ckpt/student.bin
+
+      - name: Publish to the rolling weights release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          steps="${{ needs.chunk.outputs.steps_done }}"
+          gh release view weights-latest >/dev/null 2>&1 \
+            || gh release create weights-latest --title "Student weights (rolling)" \
+                 --notes "Latest distilled browser student. Replaced whenever a run completes."
+          gh release upload weights-latest \
+            ckpt/student.bin ckpt/student-spec.json ckpt/state.json --clobber
+          {
+            echo "### Weights published"
+            echo
+            echo "- \`student.bin\` at **${steps} steps** → \`weights-latest\` release"
+            echo "- set the repo variable \`CHECKPOINT_URL\` to the asset URL to feed quantization"
+          } >> "$GITHUB_STEP_SUMMARY"

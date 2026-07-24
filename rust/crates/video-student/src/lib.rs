@@ -49,6 +49,8 @@ pub fn temporal_difference<B:Backend>(x:Tensor<B,5>)->Tensor<B,5>{let d=x.dims()
 mod tests {
     use super::*;
     use burn::backend::{ndarray::NdArrayDevice, NdArray};
+    use burn::tensor::backend::Backend;
+    type Cpu = NdArray<f32>;
 
     // Multi-head attention must use every head: changing spec.heads (width fixed)
     // changes head_dim, the softmax scale, and the per-head partition, so the
@@ -60,13 +62,13 @@ mod tests {
         let base = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 1, mlp_ratio: 2, max_tokens: 64 };
         let multi = StudentSpec { heads: 4, ..base.clone() };
         // Same seed → identical initial weights; only `heads` differs.
-        NdArray::seed(&device, 7);
-        let m1 = BrowserVideoStudent::<NdArray>::new(base, &device);
-        NdArray::seed(&device, 7);
-        let m4 = BrowserVideoStudent::<NdArray>::new(multi, &device);
-        let latents = Tensor::<NdArray, 1>::from_floats([0.3f32; 2 * 1 * 2 * 2].as_slice(), &device).reshape([1, 2, 1, 2, 2]);
-        let ts = Tensor::<NdArray, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
-        let prompt = Tensor::<NdArray, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+        <Cpu as Backend>::seed(&device, 7);
+        let m1 = BrowserVideoStudent::<Cpu>::new(base, &device);
+        <Cpu as Backend>::seed(&device, 7);
+        let m4 = BrowserVideoStudent::<Cpu>::new(multi, &device);
+        let latents = Tensor::<Cpu, 1>::from_floats([0.3f32; 2 * 1 * 2 * 2].as_slice(), &device).reshape([1, 2, 1, 2, 2]);
+        let ts = Tensor::<Cpu, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
+        let prompt = Tensor::<Cpu, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
         let (y1, _) = m1.forward(latents.clone(), ts.clone(), prompt.clone());
         let (y4, _) = m4.forward(latents, ts, prompt);
         let diff: f32 = (y1 - y4).abs().sum().into_scalar();

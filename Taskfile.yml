@@ -6,6 +6,10 @@ vars:
   DISTILL_CONFIG: '{{default "python/longlive_distill/configs/browser-384m.yaml" .DISTILL_CONFIG}}'
   TRAIN_SPEC: '{{default "rust/config/browser-390m-umt5.json" .TRAIN_SPEC}}'
   TRAIN_OUT: '{{default "artifacts/longlive-browser-burn" .TRAIN_OUT}}'
+  # Chunked-run budget, mirroring what the Kaggle kernel passes.
+  CHUNK_STEPS: '{{default "20000" .CHUNK_STEPS}}'
+  TARGET_STEPS: '{{default "200000" .TARGET_STEPS}}'
+  MAX_SECONDS: '{{default "0" .MAX_SECONDS}}'
 
 tasks:
   default:
@@ -118,6 +122,20 @@ tasks:
     requires: {vars: [CACHE]}
     cmds:
       - cargo run --release --manifest-path rust/Cargo.toml -p video-train -- train --spec {{.TRAIN_SPEC}} --cache {{.CACHE}} --output {{.TRAIN_OUT}} {{.CLI_ARGS}}
+  rust:train:chunk:
+    desc: Run one resumable chunk of a long run locally, exactly as the Kaggle kernel does
+    requires: {vars: [CACHE]}
+    cmds:
+      - |
+        resume=""
+        [ -f {{.TRAIN_OUT}}/student.mpk ] && resume="--resume {{.TRAIN_OUT}}/student.mpk"
+        cargo run --release --manifest-path rust/Cargo.toml -p video-train -- train \
+          --spec {{.TRAIN_SPEC}} --cache {{.CACHE}} --output {{.TRAIN_OUT}} \
+          --steps {{.CHUNK_STEPS}} --target-steps {{.TARGET_STEPS}} --max-seconds {{.MAX_SECONDS}} $resume {{.CLI_ARGS}}
+      - cat {{.TRAIN_OUT}}/state.json
+  kaggle:dry-run:
+    desc: Render the Kaggle training kernel and print its metadata without pushing
+    cmds: [node scripts/kaggle-orchestrate.mjs --dry-run]
   rust:weights:
     desc: Install trained Burn weights (and their matching spec) into the demo bundle
     cmds:

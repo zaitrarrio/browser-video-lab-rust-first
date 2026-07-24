@@ -80,6 +80,49 @@ jobs:
           cargo run --release --manifest-path rust/Cargo.toml -p video-native --locked -- \
             --spec rust/config/browser-smoke.json
 
+      # PyTorch-free training gate: synthesize a contract-valid teacher cache,
+      # distill on CPU, and confirm the deployable student.bin record is written.
+      # No GPU, no torch, no external checkpoint — proves the whole train→save
+      # path stays wired on every push.
+      - name: PyTorch-free training smoke
+        run: |
+          cargo run --manifest-path rust/Cargo.toml -p video-train --locked -- \
+            synth-cache --spec rust/config/browser-smoke.json --output artifacts/synth-cache \
+            --shards 2 --frames 2 --height 4 --width 4 --seq 4 --teacher-text-width 32 --relation-layers 1
+          cargo run --manifest-path rust/Cargo.toml -p video-train --locked -- \
+            train --spec rust/config/browser-smoke.json --cache artifacts/synth-cache \
+            --output artifacts/train-smoke --backend ndarray --steps 10 --lr 0.01 --log-every 5
+          test -f artifacts/train-smoke/student.bin
+
+      # Chunk-boundary gate for the free-GPU pipeline (see kaggle/README.md). The
+      # unit tests prove resumption is numerically faithful; this proves the CLI
+      # flags the Kaggle kernel actually passes are wired to it. A month-long run
+      # is only as reliable as this handoff.
+      - name: Resumable chunk smoke
+        run: |
+          chunk() {
+            cargo run --manifest-path rust/Cargo.toml -p video-train --locked -- \
+              train --spec rust/config/browser-smoke.json --cache artifacts/synth-cache \
+              --output artifacts/train-chunked --backend ndarray --lr 0.01 --log-every 50 \
+              --steps 5 --target-steps 10 "$@"
+          }
+          state() { jq -r "$1" artifacts/train-chunked/state.json; }
+          chunk
+          test "$(state '"\(.steps_done),\(.completed)"')" = "5,false"
+          test -f artifacts/train-chunked/optim.mpk
+          chunk --resume artifacts/train-chunked/student.mpk
+          test "$(state '"\(.steps_done),\(.completed),\(.chunks)"')" = "10,true,2"
+          # Past the target a chunk must be inert, so a cron overrun cannot overtrain.
+          chunk --resume artifacts/train-chunked/student.mpk
+          test "$(state '.steps_done')" = "10"
+          jq -c . artifacts/train-chunked/state.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate Kaggle training kernel
+        env:
+          KAGGLE_USERNAME: ci
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: node scripts/kaggle-orchestrate.mjs --dry-run
+
       # Layer 2: content-addressed cache of the produced weight bundle. Keyed on
       # the Rust sources + configs + checkpoint URL, so weights are reused across
       # runs whenever nothing that affects them changed.
