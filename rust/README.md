@@ -23,6 +23,12 @@ task rust:native:smoke
 task rust:wasm
 ```
 
+`rust:native:smoke` needs a Vulkan device on Linux — cubecl selects Vulkan
+unconditionally there (Metal on macOS). Headless machines without a GPU driver,
+including GitHub runners, need Mesa's software ICD:
+`sudo apt-get install -y mesa-vulkan-drivers`. Without it the run aborts with
+"No possible adapter available for backend".
+
 ## Stages
 
 1. Cache official teacher supervision once.

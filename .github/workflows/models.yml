@@ -75,7 +75,23 @@ jobs:
             estimate rust/config/browser-390m.json)
           echo "Browser student ≈ ${params} parameters" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # cubecl's AutoGraphicsApi hardcodes Vulkan on Linux (its env override is
+      # test-only), and a bare ubuntu-latest runner exposes no Vulkan ICD at all
+      # — so the adapter request panics with "No possible adapter available for
+      # backend". Mesa's lavapipe is a software Vulkan 1.3 device (what wgpu's
+      # own CI runs on), which keeps this a real WGPU execution instead of a
+      # skipped gate. The smoke spec is tiny, so a CPU device is fast enough.
+      - name: Install software Vulkan driver (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo --summary
+
       - name: Native WGPU smoke forward pass
+        env:
+          # Fail loudly on a missing/broken ICD rather than inside a worker thread.
+          VK_LOADER_DEBUG: error
         run: |
           cargo run --release --manifest-path rust/Cargo.toml -p video-native --locked -- \
             --spec rust/config/browser-smoke.json
