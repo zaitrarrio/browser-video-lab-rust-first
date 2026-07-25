@@ -77,6 +77,21 @@ def authenticate():
             "for a 1.x CLI image. Without one the checkpoint push cannot run."
         )
 
+    # Having a secret attached is not the same as the CLI accepting it: whether
+    # it wants a token or a username/key pair depends on the image's CLI major
+    # version, which we don't pin. Spend two seconds proving the credential now,
+    # because the alternative is learning at the dataset push that a full session
+    # of training has nowhere to go.
+    sh("kaggle --version", check=False)
+    probe = subprocess.run(
+        "kaggle kernels list --mine --page-size 1", shell=True, capture_output=True, text=True
+    )
+    if probe.returncode != 0:
+        raise SystemExit(
+            f"Kaggle credentials attached but rejected by the CLI:\n{probe.stderr.strip()}\n"
+            f"Attached: {', '.join(n for n, v in [('KAGGLE_API_TOKEN', token), ('KAGGLE_USERNAME', username), ('KAGGLE_KEY', key)] if v) or 'none'}"
+        )
+
 
 def push_dataset(folder: Path, slug: str, title: str, message: str):
     """Create-or-version `slug` from `folder`. Idempotent across both cases."""
