@@ -45,12 +45,17 @@ Past `--target-steps` a chunk is a no-op, so an over-eager cron cannot overtrain
 
 ## One-time setup
 
-1. **Kaggle API token** — kaggle.com → Settings → *Create New Token* (`kaggle.json`).
-2. **GitHub repo secrets** — add `KAGGLE_USERNAME` and `KAGGLE_KEY` from it.
+1. **Kaggle API token** — kaggle.com → Settings → *API* → create a token. It
+   looks like `KGAT_…`. The legacy `key` inside `kaggle.json` is **not** a
+   substitute: the 2.x CLI this pipeline pins authenticates only from a
+   `KGAT_` token in `KAGGLE_API_TOKEN`, and passing one as `KAGGLE_KEY` fails
+   with a bare `401` on `SaveKernel`.
+2. **GitHub repo secrets** — add `KAGGLE_API_TOKEN` (the token) and
+   `KAGGLE_USERNAME` (only used to namespace the kernel and dataset ids).
 3. **Kaggle notebook secrets** — the kernel versions its own datasets, so it
-   needs the same two values. Run the kernel once from the Kaggle UI, then
-   *Add-ons → Secrets* → add `KAGGLE_USERNAME` and `KAGGLE_KEY` and attach them.
-   Until this is done the kernel fails at `authenticate()`.
+   needs the token too. Push once (it will fail at `authenticate()`, which is
+   how the kernel comes into existence), open it on Kaggle, then *Add-ons →
+   Secrets* → add `KAGGLE_API_TOKEN` and attach it.
 4. **Teacher cache** — produce it once and upload it as
    `<user>/browser-video-student-chunk-teacher-cache`:
 

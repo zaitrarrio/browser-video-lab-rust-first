@@ -11,7 +11,8 @@
 // build happens on the first run after a Rust change and never again.
 //
 // Usage: node scripts/kaggle-orchestrate.mjs [--dry-run]
-// Requires: kaggle CLI on PATH, KAGGLE_USERNAME / KAGGLE_KEY in the environment.
+// Requires: kaggle CLI (2.x) on PATH, plus KAGGLE_API_TOKEN for auth and
+// KAGGLE_USERNAME to namespace the kernel and dataset ids.
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -155,11 +156,20 @@ function waitForKernel(ref, { pollSeconds = 60, timeoutSeconds }) {
 
 // --------------------------------------------------------------------- main
 
-// KAGGLE_KEY is consumed by the CLI, not by us, so a missing one would surface
-// only as the CLI's generic "Authentication required" text — and renderKernel's
-// dataset probes below would emit it three times before we ever push. Name it
-// up front. A dry run never authenticates, so it needs no credential.
-if (!DRY_RUN) env("KAGGLE_KEY");
+// KAGGLE_API_TOKEN is consumed by the CLI, not by us, so a missing one would
+// surface only as the CLI's generic "Authentication required" text — and
+// renderKernel's dataset probes below would emit it three times before we ever
+// push. Name it up front. A dry run never authenticates, so it needs none.
+//
+// It must be the `KGAT_…` token from the settings UI, not the legacy `key` from
+// kaggle.json: the 2.x CLI authenticates *only* via KAGGLE_API_TOKEN, and feeding
+// it a token through KAGGLE_USERNAME/KAGGLE_KEY fails with that same generic text.
+if (!DRY_RUN) {
+  const token = env("KAGGLE_API_TOKEN");
+  if (!token.startsWith("KGAT_")) {
+    throw new Error(`KAGGLE_API_TOKEN should be a KGAT_… access token; got ${token.length} chars starting "${token.slice(0, 5)}"`);
+  }
+}
 
 const config = { ...CONFIG, source_key: sourceKey() };
 console.log(`source key ${config.source_key.slice(0, 12)} · target ${config.target_steps} steps · commit ${config.commit.slice(0, 8)}`);

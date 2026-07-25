@@ -43,12 +43,39 @@ def sh(cmd, cwd=None, env=None, check=True):
 
 
 def authenticate():
-    """Kaggle credentials for the dataset pushes, from the kernel's own secrets."""
+    """Kaggle credentials for the dataset pushes, from the kernel's own secrets.
+
+    Which of these two the image's CLI accepts depends on its major version: 2.x
+    authenticates only from a `KGAT_…` token in KAGGLE_API_TOKEN, while 1.x wants
+    the legacy username/key pair. We can't pin the CLI inside the kernel, so take
+    whichever secret is attached and let the CLI pick it up. Failing here is cheap
+    and deliberate — it costs seconds, where discovering it after the training run
+    would throw away the whole chunk at the dataset push.
+    """
     from kaggle_secrets import UserSecretsClient
 
     secrets = UserSecretsClient()
-    os.environ["KAGGLE_USERNAME"] = secrets.get_secret("KAGGLE_USERNAME")
-    os.environ["KAGGLE_KEY"] = secrets.get_secret("KAGGLE_KEY")
+
+    def optional(name):
+        try:
+            return secrets.get_secret(name)
+        except Exception:  # not attached to this kernel
+            return None
+
+    token = optional("KAGGLE_API_TOKEN")
+    username, key = optional("KAGGLE_USERNAME"), optional("KAGGLE_KEY")
+    if token:
+        os.environ["KAGGLE_API_TOKEN"] = token
+    if username:
+        os.environ["KAGGLE_USERNAME"] = username
+    if key:
+        os.environ["KAGGLE_KEY"] = key
+    if not token and not (username and key):
+        raise SystemExit(
+            "no Kaggle credentials attached to this kernel — add KAGGLE_API_TOKEN "
+            "(preferred) under Add-ons → Secrets, or KAGGLE_USERNAME + KAGGLE_KEY "
+            "for a 1.x CLI image. Without one the checkpoint push cannot run."
+        )
 
 
 def push_dataset(folder: Path, slug: str, title: str, message: str):

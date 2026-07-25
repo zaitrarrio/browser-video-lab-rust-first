@@ -12,9 +12,10 @@ name: Train Student
 # rather than failing it, but the schedule below stays inside it deliberately.
 #
 # One-time setup before this can run — see kaggle/README.md:
-#   - repo secrets KAGGLE_USERNAME and KAGGLE_KEY (from kaggle.json)
-#   - the same two values added as *Kaggle* notebook secrets, so the kernel can
-#     version its own datasets without shipping multi-GB weights through CI
+#   - repo secrets KAGGLE_API_TOKEN (the `KGAT_…` token from Kaggle's settings
+#     UI) and KAGGLE_USERNAME
+#   - KAGGLE_API_TOKEN added again as a *Kaggle* notebook secret, so the kernel
+#     can version its own datasets without shipping multi-GB weights through CI
 #   - a teacher-cache dataset populated once, unless you opt into synthetic data
 
 on:
@@ -68,17 +69,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Pinned: the 2.x CLI reorders auth to prefer an opaque KAGGLE_API_TOKEN
-      # and demotes KAGGLE_USERNAME/KAGGLE_KEY to a "legacy" path. 1.8.4 is the
-      # last 1.x, so the secrets below stay the primary credential.
+      # 2.x is required, not merely tolerated: our credential is a `KGAT_…`
+      # access token, and only the 2.x SDK reads one (from KAGGLE_API_TOKEN).
+      # The 1.x CLI sends it as a basic-auth password, which SaveKernel rejects
+      # with a bare 401. Pinned so a CLI release can't move the auth path again.
       - name: Install Kaggle CLI
-        run: pipx install kaggle==1.8.4
+        run: pipx install kaggle==2.2.4
 
       - name: Launch training chunk
         id: train
         env:
+          # KAGGLE_API_TOKEN authenticates; KAGGLE_USERNAME only namespaces the
+          # kernel and dataset ids. KAGGLE_KEY is deliberately absent — the 2.x
+          # CLI ignores it, and holding a KGAT token there reads as a legacy key.
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
           TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}
           CHUNK_STEPS: ${{ github.event.inputs.chunk_steps || vars.CHUNK_STEPS || '20000' }}
@@ -98,15 +103,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pipx install kaggle==1.8.4 # keep in step with the chunk job above
+      - run: pipx install kaggle==2.2.4 # keep in step with the chunk job above
 
       # The run is done: pull the final Burn record out of the checkpoint cache
       # and publish it at a stable URL. `models.yml` and the demo bundle consume
       # `student.bin` + its spec exactly as `task rust:weights` does locally.
       - name: Fetch final checkpoint
         env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
           kaggle datasets download -d "${{ needs.chunk.outputs.checkpoint_dataset }}" -p ckpt --unzip
           cp "${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}" ckpt/student-spec.json
