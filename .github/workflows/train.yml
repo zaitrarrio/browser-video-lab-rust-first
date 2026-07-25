@@ -68,8 +68,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Pinned: the 2.x CLI reorders auth to prefer an opaque KAGGLE_API_TOKEN
+      # and demotes KAGGLE_USERNAME/KAGGLE_KEY to a "legacy" path. 1.8.4 is the
+      # last 1.x, so the secrets below stay the primary credential.
       - name: Install Kaggle CLI
-        run: pipx install kaggle
+        run: pipx install kaggle==1.8.4
 
       - name: Launch training chunk
         id: train
@@ -95,7 +98,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pipx install kaggle
+      - run: pipx install kaggle==1.8.4 # keep in step with the chunk job above
 
       # The run is done: pull the final Burn record out of the checkpoint cache
       # and publish it at a stable URL. `models.yml` and the demo bundle consume

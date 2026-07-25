@@ -22,9 +22,14 @@ import { join, relative } from "node:path";
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const DRY_RUN = process.argv.includes("--dry-run");
 
+// An unset GitHub secret arrives as the empty string, not as undefined. Treat
+// that as missing: an empty owner silently renders a kernel id of "/slug", and
+// the push then fails several steps later with an unrelated-looking auth error.
 const env = (name, fallback) => {
-  const value = process.env[name] ?? fallback;
-  if (value === undefined) throw new Error(`missing required environment variable ${name}`);
+  const value = process.env[name] || fallback;
+  if (value === undefined || value === "") {
+    throw new Error(`missing or empty required environment variable ${name}`);
+  }
   return value;
 };
 
@@ -143,6 +148,12 @@ function waitForKernel(ref, { pollSeconds = 60, timeoutSeconds }) {
 }
 
 // --------------------------------------------------------------------- main
+
+// KAGGLE_KEY is consumed by the CLI, not by us, so a missing one would surface
+// only as the CLI's generic "Authentication required" text — and renderKernel's
+// dataset probes below would emit it three times before we ever push. Name it
+// up front. A dry run never authenticates, so it needs no credential.
+if (!DRY_RUN) env("KAGGLE_KEY");
 
 const config = { ...CONFIG, source_key: sourceKey() };
 console.log(`source key ${config.source_key.slice(0, 12)} · target ${config.target_steps} steps · commit ${config.commit.slice(0, 8)}`);
