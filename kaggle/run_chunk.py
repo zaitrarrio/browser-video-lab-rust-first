@@ -57,10 +57,22 @@ def authenticate():
     secrets = UserSecretsClient()
 
     def optional(name):
+        """Fetch a secret, reporting *why* it was unavailable rather than hiding it.
+
+        "not attached", "attached under a different label" and "the backend said
+        no" are three different problems with three different fixes, and they are
+        indistinguishable from a bare None.
+        """
         try:
-            return secrets.get_secret(name)
-        except Exception:  # not attached to this kernel
+            value = secrets.get_secret(name)
+        except Exception as exc:
+            print(f"secret {name}: unavailable — {type(exc).__name__}: {exc}", flush=True)
             return None
+        if not value:
+            print(f"secret {name}: present but empty", flush=True)
+            return None
+        print(f"secret {name}: ok ({len(value)} chars, starts {value[:5]!r})", flush=True)
+        return value
 
     token = optional("KAGGLE_API_TOKEN")
     username, key = optional("KAGGLE_USERNAME"), optional("KAGGLE_KEY")
