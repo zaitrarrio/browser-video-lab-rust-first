@@ -57,6 +57,11 @@ const CONFIG = {
   session_seconds: Number(env("SESSION_SECONDS", String(11 * 3600))),
   upload_reserve_seconds: Number(env("UPLOAD_RESERVE_SECONDS", "900")),
   allow_synthetic_teacher: env("ALLOW_SYNTHETIC_TEACHER", "false") === "true",
+  // The kernel installs this exact CLI before authenticating, so only one
+  // credential shape is valid there — see authenticate() in run_chunk.py. CI
+  // sets it once at the workflow level and pins itself to the same value; the
+  // default here is for local runs.
+  kaggle_cli_version: env("KAGGLE_CLI_VERSION", "2.2.4"),
   toolchain_dataset: `${OWNER}/${SLUG}-toolchain`,
   toolchain_title: titleFor(`${SLUG}-toolchain`),
   teacher_dataset: `${OWNER}/${SLUG}-teacher-cache`,

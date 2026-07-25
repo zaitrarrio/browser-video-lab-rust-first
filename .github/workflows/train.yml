@@ -46,6 +46,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # One pin for all three consumers: this job, the promote job, and the kernel
+  # itself, which installs it before authenticating (run_chunk.py:authenticate).
+  # 2.x is required, not merely tolerated — see the install step below.
+  KAGGLE_CLI_VERSION: "2.2.4"
+
 jobs:
   chunk:
     name: Train one chunk on Kaggle GPU
@@ -74,7 +80,7 @@ jobs:
       # The 1.x CLI sends it as a basic-auth password, which SaveKernel rejects
       # with a bare 401. Pinned so a CLI release can't move the auth path again.
       - name: Install Kaggle CLI
-        run: pipx install kaggle==2.2.4
+        run: pipx install "kaggle==$KAGGLE_CLI_VERSION"
 
       - name: Launch training chunk
         id: train
@@ -103,7 +109,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pipx install kaggle==2.2.4 # keep in step with the chunk job above
+      - run: pipx install "kaggle==$KAGGLE_CLI_VERSION"
 
       # The run is done: pull the final Burn record out of the checkpoint cache
       # and publish it at a stable URL. `models.yml` and the demo bundle consume

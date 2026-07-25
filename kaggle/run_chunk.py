@@ -43,66 +43,37 @@ def sh(cmd, cwd=None, env=None, check=True):
 
 
 def authenticate():
-    """Kaggle credentials for the dataset pushes, from the kernel's own secrets.
+    """The `KGAT_…` token, from this kernel's own secrets. Required, not optional.
 
-    Which of these two the image's CLI accepts depends on its major version: 2.x
-    authenticates only from a `KGAT_…` token in KAGGLE_API_TOKEN, while 1.x wants
-    the legacy username/key pair. We can't pin the CLI inside the kernel, so take
-    whichever secret is attached and let the CLI pick it up. Failing here is cheap
-    and deliberate — it costs seconds, where discovering it after the training run
-    would throw away the whole chunk at the dataset push.
+    Pinning the CLI here — as CI does — is what makes that a single requirement
+    rather than a guess: 2.x authenticates only from KAGGLE_API_TOKEN, 1.x only
+    from a legacy username/key pair, and the image's own version is not ours to
+    rely on. One pinned CLI, one valid credential shape, one way to fail.
     """
+    sh(f"pip install --quiet --upgrade kaggle=={CONFIG['kaggle_cli_version']}")
+    sh("kaggle --version", check=False)
+
     from kaggle_secrets import UserSecretsClient
 
-    secrets = UserSecretsClient()
-
-    def optional(name):
-        """Fetch a secret, reporting *why* it was unavailable rather than hiding it.
-
-        "not attached", "attached under a different label" and "the backend said
-        no" are three different problems with three different fixes, and they are
-        indistinguishable from a bare None.
-        """
-        try:
-            value = secrets.get_secret(name)
-        except Exception as exc:
-            print(f"secret {name}: unavailable — {type(exc).__name__}: {exc}", flush=True)
-            return None
-        if not value:
-            print(f"secret {name}: present but empty", flush=True)
-            return None
-        print(f"secret {name}: ok ({len(value)} chars, starts {value[:5]!r})", flush=True)
-        return value
-
-    token = optional("KAGGLE_API_TOKEN")
-    username, key = optional("KAGGLE_USERNAME"), optional("KAGGLE_KEY")
-    if token:
-        os.environ["KAGGLE_API_TOKEN"] = token
-    if username:
-        os.environ["KAGGLE_USERNAME"] = username
-    if key:
-        os.environ["KAGGLE_KEY"] = key
-    if not token and not (username and key):
+    # Deliberately unguarded: Kaggle's own exception distinguishes "not attached"
+    # from "attached under another label" from a backend refusal, and any message
+    # substituted for it here would be strictly less informative.
+    token = UserSecretsClient().get_secret("KAGGLE_API_TOKEN")
+    if not token or not token.startswith("KGAT_"):
         raise SystemExit(
-            "no Kaggle credentials attached to this kernel — add KAGGLE_API_TOKEN "
-            "(preferred) under Add-ons → Secrets, or KAGGLE_USERNAME + KAGGLE_KEY "
-            "for a 1.x CLI image. Without one the checkpoint push cannot run."
+            f"the KAGGLE_API_TOKEN secret is not a KGAT_ token ({len(token or '')} chars) — "
+            "copy it from kaggle.com → Settings → API, not from kaggle.json"
         )
+    os.environ["KAGGLE_API_TOKEN"] = token
+    print(f"KAGGLE_API_TOKEN ok ({len(token)} chars)", flush=True)
 
-    # Having a secret attached is not the same as the CLI accepting it: whether
-    # it wants a token or a username/key pair depends on the image's CLI major
-    # version, which we don't pin. Spend two seconds proving the credential now,
-    # because the alternative is learning at the dataset push that a full session
-    # of training has nowhere to go.
-    sh("kaggle --version", check=False)
+    # A well-formed token is not an accepted one. Two seconds now beats learning
+    # at the dataset push that a full session of training has nowhere to go.
     probe = subprocess.run(
         "kaggle kernels list --mine --page-size 1", shell=True, capture_output=True, text=True
     )
     if probe.returncode != 0:
-        raise SystemExit(
-            f"Kaggle credentials attached but rejected by the CLI:\n{probe.stderr.strip()}\n"
-            f"Attached: {', '.join(n for n, v in [('KAGGLE_API_TOKEN', token), ('KAGGLE_USERNAME', username), ('KAGGLE_KEY', key)] if v) or 'none'}"
-        )
+        raise SystemExit(f"KAGGLE_API_TOKEN rejected by the CLI:\n{probe.stderr.strip()}")
 
 
 def push_dataset(folder: Path, slug: str, title: str, message: str):
