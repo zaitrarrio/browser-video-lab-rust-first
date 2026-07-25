@@ -13,9 +13,10 @@ name: Train Student
 #
 # One-time setup before this can run — see kaggle/README.md:
 #   - repo secrets KAGGLE_API_TOKEN (the `KGAT_…` token from Kaggle's settings
-#     UI) and KAGGLE_USERNAME
-#   - KAGGLE_API_TOKEN added again as a *Kaggle* notebook secret, so the kernel
-#     can version its own datasets without shipping multi-GB weights through CI
+#     UI) and KAGGLE_USERNAME. The orchestrator injects the token into the
+#     kernel it renders, so there is no notebook secret to attach by hand.
+#   - a phone-verified Kaggle account, or the kernel gets no internet and no GPU
+#     however the metadata is set
 #   - a teacher-cache dataset populated once, unless you opt into synthetic data
 
 on:

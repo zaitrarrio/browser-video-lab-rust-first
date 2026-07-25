@@ -37,6 +37,24 @@ const env = (name, fallback) => {
 const OWNER = env("KAGGLE_USERNAME");
 const SLUG = env("KAGGLE_KERNEL_SLUG", "browser-video-student-chunk");
 
+// Authenticates both the CLI calls below and the kernel itself, which gets it
+// injected into its rendered source. Kaggle exposes no API for attaching a
+// notebook secret — no SDK service, no CLI subcommand, no field on the kernel
+// push — so a secret-based kernel needs a manual UI step per slug, forever.
+// Injection is what keeps this pipeline headless; the cost is a cleartext token
+// in the kernel's source and version history. See kaggle/README.md.
+//
+// A dry run renders without credentials, so it gets a placeholder — that also
+// keeps a real token out of any file written by `--dry-run`.
+const API_TOKEN = DRY_RUN ? "KGAT_placeholder_for_dry_run_only_00" : env("KAGGLE_API_TOKEN");
+if (!API_TOKEN.startsWith("KGAT_")) {
+  throw new Error(
+    `KAGGLE_API_TOKEN should be a KGAT_… access token from kaggle.com → Settings → API; ` +
+    `got ${API_TOKEN.length} chars starting "${API_TOKEN.slice(0, 5)}". The legacy key from ` +
+    `kaggle.json is not a substitute — the 2.x CLI cannot authenticate with it.`
+  );
+}
+
 // Kaggle slugifies a kernel's *title* and warns when the result doesn't match the
 // id we asked for — then may well create the thing under the title's slug, leaving
 // every later `status`/`output`/`download` pointed at something that isn't there.
@@ -57,6 +75,7 @@ const CONFIG = {
   session_seconds: Number(env("SESSION_SECONDS", String(11 * 3600))),
   upload_reserve_seconds: Number(env("UPLOAD_RESERVE_SECONDS", "900")),
   allow_synthetic_teacher: env("ALLOW_SYNTHETIC_TEACHER", "false") === "true",
+  api_token: API_TOKEN,
   // The kernel installs this exact CLI before authenticating, so only one
   // credential shape is valid there — see authenticate() in run_chunk.py. CI
   // sets it once at the workflow level and pins itself to the same value; the
@@ -160,21 +179,6 @@ function waitForKernel(ref, { pollSeconds = 60, timeoutSeconds }) {
 }
 
 // --------------------------------------------------------------------- main
-
-// KAGGLE_API_TOKEN is consumed by the CLI, not by us, so a missing one would
-// surface only as the CLI's generic "Authentication required" text — and
-// renderKernel's dataset probes below would emit it three times before we ever
-// push. Name it up front. A dry run never authenticates, so it needs none.
-//
-// It must be the `KGAT_…` token from the settings UI, not the legacy `key` from
-// kaggle.json: the 2.x CLI authenticates *only* via KAGGLE_API_TOKEN, and feeding
-// it a token through KAGGLE_USERNAME/KAGGLE_KEY fails with that same generic text.
-if (!DRY_RUN) {
-  const token = env("KAGGLE_API_TOKEN");
-  if (!token.startsWith("KGAT_")) {
-    throw new Error(`KAGGLE_API_TOKEN should be a KGAT_… access token; got ${token.length} chars starting "${token.slice(0, 5)}"`);
-  }
-}
 
 const config = { ...CONFIG, source_key: sourceKey() };
 console.log(`source key ${config.source_key.slice(0, 12)} · target ${config.target_steps} steps · commit ${config.commit.slice(0, 8)}`);

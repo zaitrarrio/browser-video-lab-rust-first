@@ -52,10 +52,10 @@ Past `--target-steps` a chunk is a no-op, so an over-eager cron cannot overtrain
    with a bare `401` on `SaveKernel`.
 2. **GitHub repo secrets** — add `KAGGLE_API_TOKEN` (the token) and
    `KAGGLE_USERNAME` (only used to namespace the kernel and dataset ids).
-3. **Kaggle notebook secrets** — the kernel versions its own datasets, so it
-   needs the token too. Push once (it will fail at `authenticate()`, which is
-   how the kernel comes into existence), open it on Kaggle, then *Add-ons →
-   Secrets* → add `KAGGLE_API_TOKEN` and attach it.
+3. **Phone verification** — kaggle.com → Settings. Without it a kernel gets no
+   internet and no GPU, *regardless of what the kernel metadata asks for*: the
+   push is accepted, `enable_internet` reads back as true, and the session then
+   fails at the first DNS lookup. `require_internet()` names this on sight.
 4. **Teacher cache** — produce it once and upload it as
    `<user>/browser-video-student-chunk-teacher-cache`:
 
@@ -69,6 +69,21 @@ Past `--target-steps` a chunk is a no-op, so an over-eager cron cannot overtrain
    full GPU path and produces a *running* student, never a good one.
 
 5. **Optional repo variables** — `TRAIN_SPEC`, `CHUNK_STEPS`, `TARGET_STEPS`.
+
+## Where the credential lives
+
+The kernel authenticates from a token **injected into its rendered source**, not
+from a Kaggle notebook secret. Kaggle has no API for attaching a secret — no SDK
+service, no CLI subcommand, no field on the kernel push — so secrets would mean a
+manual browser step for every new kernel slug, which is precisely what this
+pipeline exists to avoid.
+
+The cost is that `KAGGLE_API_TOKEN` sits in cleartext in the kernel's source and
+in every version's history on Kaggle, readable with `kaggle kernels pull`. The
+kernel is pushed `is_private: true`, so today that means you alone — but
+**publishing or sharing the kernel publishes the token with it**, and it grants
+full API access to the account. If that ever happens, rotate it immediately at
+kaggle.com → Settings → *API*.
 
 ## Running it
 

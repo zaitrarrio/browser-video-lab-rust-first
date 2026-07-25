@@ -75,19 +75,13 @@ def authenticate():
     sh(f"pip install --quiet --upgrade kaggle=={CONFIG['kaggle_cli_version']}")
     sh("kaggle --version", check=False)
 
-    from kaggle_secrets import UserSecretsClient
-
-    # Deliberately unguarded: Kaggle's own exception distinguishes "not attached"
-    # from "attached under another label" from a backend refusal, and any message
-    # substituted for it here would be strictly less informative.
-    token = UserSecretsClient().get_secret("KAGGLE_API_TOKEN")
-    if not token or not token.startswith("KGAT_"):
-        raise SystemExit(
-            f"the KAGGLE_API_TOKEN secret is not a KGAT_ token ({len(token or '')} chars) — "
-            "copy it from kaggle.com → Settings → API, not from kaggle.json"
-        )
+    # Injected by the orchestrator, not read from a notebook secret: Kaggle has no
+    # API for attaching one, so secrets would mean a manual UI step for every new
+    # kernel slug and would keep this pipeline from ever being headless. The token
+    # therefore lives in this file's source on Kaggle — private, but cleartext.
+    token = CONFIG["api_token"]
     os.environ["KAGGLE_API_TOKEN"] = token
-    print(f"KAGGLE_API_TOKEN ok ({len(token)} chars)", flush=True)
+    print(f"KAGGLE_API_TOKEN injected ({len(token)} chars)", flush=True)
 
     # A well-formed token is not an accepted one. Two seconds now beats learning
     # at the dataset push that a full session of training has nowhere to go.
