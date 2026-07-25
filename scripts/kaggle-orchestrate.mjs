@@ -35,6 +35,12 @@ const env = (name, fallback) => {
 
 const OWNER = env("KAGGLE_USERNAME");
 const SLUG = env("KAGGLE_KERNEL_SLUG", "browser-video-student-chunk");
+
+// Kaggle slugifies a kernel's *title* and warns when the result doesn't match the
+// id we asked for — then may well create the thing under the title's slug, leaving
+// every later `status`/`output`/`download` pointed at something that isn't there.
+// Deriving titles from the slug keeps the two in lockstep under any SLUG override.
+const titleFor = (slug) => slug.replace(/-/g, " ").replace(/^./, (c) => c.toUpperCase());
 const CONFIG = {
   repo_url: env("REPO_URL"),
   commit: env("GITHUB_SHA", execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT }).toString().trim()),
@@ -51,10 +57,10 @@ const CONFIG = {
   upload_reserve_seconds: Number(env("UPLOAD_RESERVE_SECONDS", "900")),
   allow_synthetic_teacher: env("ALLOW_SYNTHETIC_TEACHER", "false") === "true",
   toolchain_dataset: `${OWNER}/${SLUG}-toolchain`,
-  toolchain_title: "Browser video student · trainer toolchain",
+  toolchain_title: titleFor(`${SLUG}-toolchain`),
   teacher_dataset: `${OWNER}/${SLUG}-teacher-cache`,
   checkpoint_dataset: `${OWNER}/${SLUG}-checkpoint`,
-  checkpoint_title: "Browser video student · checkpoint",
+  checkpoint_title: titleFor(`${SLUG}-checkpoint`),
 };
 
 // ---------------------------------------------------------------- source key
@@ -111,7 +117,7 @@ function renderKernel(config) {
   writeFileSync(join(dir, "run_chunk.py"), template.replace("{{CONFIG}}", JSON.stringify(config, null, 2)));
   writeFileSync(join(dir, "kernel-metadata.json"), JSON.stringify({
     id: `${OWNER}/${SLUG}`,
-    title: "Browser video student · training chunk",
+    title: titleFor(SLUG),
     code_file: "run_chunk.py",
     language: "python",
     kernel_type: "script",
