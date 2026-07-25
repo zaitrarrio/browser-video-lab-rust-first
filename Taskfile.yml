@@ -17,7 +17,7 @@ tasks:
     cmds: [task --list]
   setup:
     desc: Install browser dependencies
-    cmds: [npm install --cache {{.NPM_CACHE}} --ignore-scripts]
+    cmds: ["npm install --cache {{.NPM_CACHE}} --ignore-scripts"]
     sources: [package.json, package-lock.json]
     generates: [node_modules/.package-lock.json]
   setup:python:
@@ -99,11 +99,11 @@ tasks:
   rust:quantize:
     desc: Convert F32 Safetensors weights to the shared Q8 bundle
     requires: {vars: [CHECKPOINT]}
-    cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8]
+    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8"]
   rust:quantize:q4:
     desc: Create Q4 weights after the Q8 quality gate passes
     requires: {vars: [CHECKPOINT]}
-    cmds: [cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4]
+    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4"]
   rust:wasm:
     desc: Build the Burn/WGPU browser module
     cmds:
