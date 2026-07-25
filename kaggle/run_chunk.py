@@ -42,6 +42,28 @@ def sh(cmd, cwd=None, env=None, check=True):
     return subprocess.run(cmd, shell=True, cwd=cwd, env=merged, check=check)
 
 
+def require_internet():
+    """Fail immediately, and legibly, on a kernel that has no network.
+
+    Every stage needs it: cloning the repo, installing the CLI, reaching the
+    secrets backend, pushing the checkpoint. Kaggle accepts `enable_internet`
+    in the metadata and reports it back as true regardless, but the setting only
+    takes effect on a phone-verified account — so the request succeeding tells
+    you nothing, and the first symptom is otherwise ~200s of pip DNS retries.
+    """
+    import socket
+
+    try:
+        socket.getaddrinfo("pypi.org", 443)
+    except socket.gaierror as exc:
+        raise SystemExit(
+            f"this kernel has no internet ({exc}).\n"
+            "The metadata requested it and Kaggle accepted, but the setting only applies "
+            "to a phone-verified account: kaggle.com → Settings → Phone Verification, then "
+            "re-run. Without it the chunk cannot clone, install, authenticate, or push."
+        )
+
+
 def authenticate():
     """The `KGAT_…` token, from this kernel's own secrets. Required, not optional.
 
@@ -169,6 +191,7 @@ def restore_checkpoint() -> Path | None:
 
 
 def main():
+    require_internet()
     authenticate()
     checkout_repo()
     trainer = restore_toolchain()
