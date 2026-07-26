@@ -76,9 +76,19 @@ runtime, so typing a different prompt changes the output even before a real
 encoder is shipped. A unit test proves the student is genuinely conditioned on
 the prompt (different embeddings → different output).
 
-Remaining: **Phase 2** — a one-time teacher cache to make the weights *trained*
-rather than random (Plan B/Wan2.1 under the no-GPU constraint). After that the
-browser student is small, fast, promptable, and actually distilled.
+**Phase 2 (teacher cache, Plan B) — implemented, pending a real run.** The
+CPU-only Wan2.1 path is in the tree: `python/wan21_teacher_adapter.py` (real
+Diffusers loader + block hooks, plus a toy CPU teacher with the real token
+geometry), a generalized `cache_teacher.py` (adapter-driven, `--device cpu`,
+`--draws-per-clip`, `--relation-layers` cap, umt5 student embeddings), and
+`make_dataset.py` (synthetic + real umt5 encoding). A pytest and a cross-stack
+smoke prove it end to end on CPU: a Python toy-teacher cache is accepted by Rust
+`validate-cache` and **trains the Burn student** (`task teacher:cache:smoke`,
+`task teacher:test`). What remains is the *actual* run — encode real captions,
+cache the frozen 17.5 GB Wan2.1 teacher on a rented/Kaggle CPU, and train — plus
+confirming CPU throughput for a 1.3B DiT (the one unmeasured risk) and the pinned
+`diffusers` forward signature. After that run, the browser student is small, fast,
+promptable, and actually distilled.
 
 ### The teacher decision
 

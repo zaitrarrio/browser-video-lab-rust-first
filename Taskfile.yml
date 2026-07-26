@@ -79,6 +79,25 @@ tasks:
     requires: {vars: [TEACHER_ADAPTER, DATASET]}
     cmds: ['{{.PYTHON}} -m longlive_distill.cache_teacher --adapter {{.TEACHER_ADAPTER}} --dataset {{.DATASET}} --output data/teacher-cache {{.CLI_ARGS}}']
     env: {PYTHONPATH: python}
+  teacher:cache:wan21:
+    desc: 'Plan B: cache the Wan2.1-1.3B teacher (Apache-2.0, CPU) from a caption dataset. Set DATASET (dir of .pt items from make_dataset).'
+    deps: [setup:wan]
+    requires: {vars: [DATASET]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.cache_teacher --adapter wan21_teacher_adapter:build_teacher --dataset {{.DATASET}} --output data/teacher-cache --device cpu --draws-per-clip 8 --relation-layers 6 {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
+  teacher:cache:smoke:
+    desc: 'CPU end-to-end proof (no GPU, no download): synthetic dataset -> toy Wan2.1 teacher cache -> Rust validate-cache'
+    deps: [setup:python]
+    cmds:
+      - '{{.PYTHON}} -m longlive_distill.make_dataset --synthetic --output artifacts/wan-data --count 3 --seq 4 --teacher-width 4096 --student-width 16 --latent-shape 16 2 4 4'
+      - '{{.PYTHON}} -m longlive_distill.cache_teacher --adapter wan21_teacher_adapter:build_teacher --adapter-arg toy=true --dataset artifacts/wan-data --output artifacts/wan-cache --draws-per-clip 4 --relation-layers 2'
+      - cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache artifacts/wan-cache
+    env: {PYTHONPATH: python}
+  teacher:test:
+    desc: Run the Python teacher-cache contract tests (CPU, no download)
+    deps: [setup:python]
+    cmds: ['{{.PYTHON}} -m pytest python/tests -q']
+    env: {PYTHONPATH: python}
   onnx:student:
     desc: Export the distilled student to public/models/onnx for the ONNX Runtime Web demo
     deps: [setup:python]
