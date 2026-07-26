@@ -42,6 +42,24 @@ docs under-weight is that gaps 2 and 4 are *the same class of bug* as the meta-f
 geometry the synthetic generator invents to match itself — so they should be fixed
 together, behind one "real-geometry" gate.
 
+### Status — Phase 0 landed on this branch
+
+The teacher-free, GPU-free gate is implemented:
+
+- **Gap 2 (patchify) — done.** `BrowserVideoStudent::forward` now patchifies
+  `patch_size` (default `[1,2,2]`); a 4×32×48 latent runs 1536 tokens, not 6144
+  (16× less attention), and the hidden relation grams now match a Wan teacher's.
+- **Gap 4 (channels) — done.** `latent_channels` reconciled to real VAE z-dims:
+  16-ch Wan2.1 is the default on every build/demo path; a 48-ch Wan2.2 config
+  ships as a documented (GPU-teacher) option. The param count stays ~383M.
+- **Gap 3 (cache scale) — done for the Rust path.** The eager RAM load is replaced
+  by a bounded lazy `ShardCache`; `synth-cache --draws-per-clip` multiplies
+  supervision per clip. Token subsampling is intentionally deferred (patchify
+  already aligns the grams, making it a size optimization, not a correctness fix).
+
+Remaining for a shippable, promptable model: **Phase 1** (quantize producer +
+consumer, gap 1) and **Phase 3** (a browser umt5-small encoder, gap 5).
+
 ### The teacher decision
 
 `TEACHER-OPTIONS.md` reduces cleanly to one question — **is there budget for a few hours
@@ -160,9 +178,9 @@ step blocked by anything but work.
 ## 5. Bottom line
 
 The findings are accurate, source-grounded, and honest about their own blind spot. The
-architecture is done; the recurring pipeline is not. The correct first move is **Phase 0**
-— patchify, channel reconciliation, and cache-format v2 — because it is teacher-free,
-GPU-free, fixes the trainability blocker and the largest speed lever at once, and is the
-only work that cannot be wasted by a later teacher decision. Quantization (Phase 1) then
-makes the artifact shippable, and the teacher (Phase 2) makes it *good*. The prompt
+architecture is done; the recurring pipeline is not. **Phase 0 — patchify, channel
+reconciliation, and cache-format v2 — is now implemented on this branch:** it was
+teacher-free, GPU-free, and fixed the trainability blocker and the largest speed lever at
+once, so none of it can be wasted by a later teacher decision. Quantization (Phase 1) is
+next and makes the artifact shippable; the teacher (Phase 2) makes it *good*; the prompt
 (Phase 3) decides whether it is a product.

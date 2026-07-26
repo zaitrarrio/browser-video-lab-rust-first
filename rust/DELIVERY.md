@@ -78,6 +78,13 @@ teacher decision:
 
 ## The student does 16× the attention work of its own teacher
 
+> **Update — addressed (Phase 0).** The student now patchifies with `patch_size`
+> (default `[1,2,2]`): a `[1,4,4,32,48]` latent runs 1536 tokens instead of 6144,
+> and the relation grams line up with a Wan teacher. `latent_channels` is
+> reconciled to real VAE z-dims (16-ch Wan2.1 default, 48-ch Wan2.2 optional), and
+> the eager shard RAM load is replaced by a bounded lazy loader. The section below
+> is retained as the original analysis that motivated the change.
+
 Download size is one half of "will this run in a browser". The other half is
 tokens, and there is a large, free win sitting here.
 
