@@ -1,6 +1,8 @@
 use burn::{nn::{Gelu, LayerNorm, LayerNormConfig, Linear, LinearConfig}, prelude::*};
 use video_contract::StudentSpec;
 
+pub mod quant;
+
 #[derive(Module, Debug)]
 pub struct MixerBlock<B: Backend> {
     norm: LayerNorm<B>, q: Linear<B>, k: Linear<B>, v: Linear<B>, proj: Linear<B>,

@@ -6,6 +6,9 @@ vars:
   DISTILL_CONFIG: '{{default "python/longlive_distill/configs/browser-384m.yaml" .DISTILL_CONFIG}}'
   TRAIN_SPEC: '{{default "rust/config/browser-390m-umt5.json" .TRAIN_SPEC}}'
   TRAIN_OUT: '{{default "artifacts/longlive-browser-burn" .TRAIN_OUT}}'
+  # Quantization reads the trained Burn record; its spec must match the record.
+  QUANT_SPEC: '{{default "rust/config/browser-390m-umt5.json" .QUANT_SPEC}}'
+  CHECKPOINT: '{{default "artifacts/longlive-browser-burn/student.mpk" .CHECKPOINT}}'
   # Chunked-run budget, mirroring what the Kaggle kernel passes.
   CHUNK_STEPS: '{{default "20000" .CHUNK_STEPS}}'
   TARGET_STEPS: '{{default "200000" .TARGET_STEPS}}'
@@ -97,13 +100,19 @@ tasks:
     desc: Validate framework-neutral teacher shards
     cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache --path data/teacher-cache]
   rust:quantize:
-    desc: Convert F32 Safetensors weights to the shared Q8 bundle
-    requires: {vars: [CHECKPOINT]}
-    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8"]
+    desc: Quantize a trained student record (student.bin/.mpk) to the Q8 bundle
+    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --spec {{.QUANT_SPEC}} --weights {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8"]
   rust:quantize:q4:
     desc: Create Q4 weights after the Q8 quality gate passes
-    requires: {vars: [CHECKPOINT]}
-    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --input {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4"]
+    cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --spec {{.QUANT_SPEC}} --weights {{.CHECKPOINT}} --output artifacts/student-q4 --bits 4"]
+  rust:weights:q:
+    desc: Install a quantized bundle (index.json + weights.q*) into the demo, preferring Q4
+    cmds:
+      - |
+        src=artifacts/student-q4; [ -d "$src" ] || src=artifacts/student-q8
+        test -d "$src" || { echo "no quantized bundle in artifacts/student-q4|q8 — run rust:quantize first" >&2; exit 1; }
+        cp "$src"/index.json "$src"/weights.q* public/rust-video/
+        cp {{.QUANT_SPEC}} public/rust-video/student-spec.json
   rust:wasm:
     desc: Build the Burn/WGPU browser module
     cmds:
@@ -151,6 +160,9 @@ tasks:
       - test -d artifacts/student-q8 && cp -r artifacts/student-q8 model-bundle/student-q8 || true
       - test -d artifacts/student-q4 && cp -r artifacts/student-q4 model-bundle/student-q4 || true
       - test -f {{.TRAIN_OUT}}/student.bin && cp {{.TRAIN_OUT}}/student.bin model-bundle/rust-video/student.bin && cp {{.TRAIN_SPEC}} model-bundle/rust-video/student-spec.json || true
+      # Serve the quantized bundle to the demo runtime too (rust-video.ts prefers
+      # it over student.bin); Q4 wins when both exist.
+      - src=artifacts/student-q4; [ -d "$src" ] || src=artifacts/student-q8; test -d "$src" && cp "$src"/index.json "$src"/weights.q* model-bundle/rust-video/ || true
       - task: models:manifest
   models:manifest:
     desc: Write a content-addressed (sha256) manifest of the model bundle for browser caching

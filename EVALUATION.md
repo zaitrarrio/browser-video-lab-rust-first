@@ -57,8 +57,18 @@ The teacher-free, GPU-free gate is implemented:
   supervision per clip. Token subsampling is intentionally deferred (patchify
   already aligns the grams, making it a size optimization, not a correctness fix).
 
-Remaining for a shippable, promptable model: **Phase 1** (quantize producer +
-consumer, gap 1) and **Phase 3** (a browser umt5-small encoder, gap 5).
+**Phase 1 (quantization, gap 1) — done.** `video-cli quantize` now reads the
+trained Burn record (`student.bin`/`.mpk`) and writes an int8/int4 bundle
+(`weights.q{bits}` + ordered `index.json`); `video-web::prepare_with_quantized`
+dequantizes it onto a fresh model in module order (no tensor names, so producer
+and consumer can't drift), and `rust-video.ts` prefers a quantized bundle over
+`student.bin`. int4 is 8× smaller than F32 — 1.53 GB → **~191 MB** for the 390M
+spec. A unit test proves the bundle reconstructs the model's forward pass; a CI
+smoke proves the record→bundle wiring.
+
+Remaining for a promptable model: **Phase 3** (a browser umt5-small encoder,
+gap 5), and eventually **Phase 2** (a one-time teacher cache to make the weights
+*trained* rather than random — Plan B/Wan2.1 under the no-GPU constraint).
 
 ### The teacher decision
 

@@ -27,6 +27,7 @@ type WasmModule = {
   BrowserModel: new (specJson: string) => {
     prepare(): Promise<void>;
     prepare_with_weights(weights: Uint8Array): Promise<void>;
+    prepare_with_quantized(indexJson: string, weights: Uint8Array): Promise<void>;
     trained(): boolean;
     generate(seed: number, steps: number, side: number): Promise<Uint8Array>;
     backend(): string;
@@ -54,22 +55,39 @@ export class RustVideoRuntime {
 
     this.model = new mod.BrowserModel(JSON.stringify(spec));
     progress("Acquiring WebGPU adapter…");
-    // Load trained weights (a video-train BinFileRecorder record) when the
-    // bundle ships them; otherwise fall back to random init so the demo still
-    // runs. The status line always says which one the user is looking at.
-    let loaded = false;
+    // Prefer a quantized bundle (index.json + weights.q{bits}), then the
+    // full-precision student.bin, then random init so the demo still runs. The
+    // status line always says which one the user is looking at.
+    const isHtml = (r: Response) => (r.headers.get("content-type") ?? "").includes("text/html");
+    let source = "random init";
     try {
-      const wr = await fetch(`${base}rust-video/student.bin`);
-      if (wr.ok && !(wr.headers.get("content-type") ?? "").includes("text/html")) {
-        await this.model.prepare_with_weights(new Uint8Array(await wr.arrayBuffer()));
-        loaded = true;
+      const ir = await fetch(`${base}rust-video/index.json`);
+      if (ir.ok && !isHtml(ir)) {
+        const indexText = await ir.text();
+        const bits = (JSON.parse(indexText) as Array<{bits: number}>)[0]?.bits ?? 8;
+        const wr = await fetch(`${base}rust-video/weights.q${bits}`);
+        if (wr.ok && !isHtml(wr)) {
+          await this.model.prepare_with_quantized(indexText, new Uint8Array(await wr.arrayBuffer()));
+          source = `trained weights (int${bits})`;
+        }
       }
     } catch {
-      /* fall through to random init */
+      /* fall through to student.bin / random init */
     }
-    if (!loaded) await this.model.prepare();
+    if (source === "random init") {
+      try {
+        const wr = await fetch(`${base}rust-video/student.bin`);
+        if (wr.ok && !isHtml(wr)) {
+          await this.model.prepare_with_weights(new Uint8Array(await wr.arrayBuffer()));
+          source = "trained weights (f32)";
+        }
+      } catch {
+        /* fall through to random init */
+      }
+    }
+    if (source === "random init") await this.model.prepare();
     const params = Math.round(this.model.parameters() / 1e6);
-    progress(`Rust student ready · ${this.model.backend()} · ~${params}M params · ${loaded ? "trained weights" : "random init"}`);
+    progress(`Rust student ready · ${this.model.backend()} · ~${params}M params · ${source}`);
   }
 
   async run(

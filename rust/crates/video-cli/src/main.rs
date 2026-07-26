@@ -1,9 +1,70 @@
-use anyhow::{bail,Result};use clap::{Parser,Subcommand};use safetensors::SafeTensors;use serde::Serialize;use std::{fs,path::PathBuf};use video_contract::{validate_cache,StudentSpec};
-#[derive(Parser)]struct App{#[command(subcommand)]command:Command}
-#[derive(Subcommand)]enum Command{ValidateCache{path:PathBuf},Estimate{spec:PathBuf},Quantize{input:PathBuf,output:PathBuf,#[arg(long,default_value_t=8)]bits:u8}}
-#[derive(Serialize)]struct QTensor{name:String,shape:Vec<usize>,scale:f32,offset:u64,length:u64,bits:u8}
-fn main()->Result<()>{match App::parse().command{
- Command::ValidateCache{path}=>{let m=validate_cache(&path)?;println!("validated {} shards from {}",m.shards.len(),m.teacher)},
- Command::Estimate{spec}=>{let s:StudentSpec=serde_json::from_slice(&fs::read(spec)?)?;s.validate()?;println!("{}",s.approximate_parameters())},
- Command::Quantize{input,output,bits}=>quantize(input,output,bits)?,}Ok(())}
-fn quantize(input:PathBuf,output:PathBuf,bits:u8)->Result<()>{if bits!=4&&bits!=8{bail!("bits must be 4 or 8")}let bytes=fs::read(input)?;let st=SafeTensors::deserialize(&bytes)?;fs::create_dir_all(&output)?;let mut binary=Vec::new();let mut index=Vec::new();for(name,v)in st.tensors(){if v.dtype()!=safetensors::Dtype::F32{continue}let values: &[f32]=bytemuck::cast_slice(v.data());let qmax=if bits==8{127.0}else{7.0};let max=values.iter().fold(0f32,|m,x|m.max(x.abs()));let scale=(max/qmax).max(1e-12);let offset=binary.len()as u64;if bits==8{binary.extend(values.iter().map(|x|(x/scale).round().clamp(-127.0,127.0)as i8 as u8))}else{for pair in values.chunks(2){let a=((pair[0]/scale).round().clamp(-7.0,7.0)as i8+8)as u8;let b=pair.get(1).map(|x|((*x/scale).round().clamp(-7.0,7.0)as i8+8)as u8).unwrap_or(8);binary.push((b<<4)|(a&15))}}index.push(QTensor{name,shape:v.shape().to_vec(),scale,offset,length:values.len()as u64,bits})}if index.is_empty(){bail!("no F32 tensors found")}fs::write(output.join(format!("weights.q{bits}")),binary)?;fs::write(output.join("index.json"),serde_json::to_vec_pretty(&index)?)?;Ok(())}
+use anyhow::{bail, Result};
+use burn::backend::{ndarray::NdArrayDevice, NdArray};
+use burn::module::Module;
+use burn::record::{BinFileRecorder, FullPrecisionSettings, NamedMpkFileRecorder};
+use clap::{Parser, Subcommand};
+use std::{fs, path::PathBuf};
+use video_contract::{validate_cache, StudentSpec};
+use video_student::{quant::quantize_module, BrowserVideoStudent};
+
+type Cpu = NdArray<f32>;
+
+#[derive(Parser)]
+struct App { #[command(subcommand)] command: Command }
+
+#[derive(Subcommand)]
+enum Command {
+    /// Validate a teacher cache manifest and its shards.
+    ValidateCache { path: PathBuf },
+    /// Print the approximate student parameter count for a spec.
+    Estimate { spec: PathBuf },
+    /// Quantize a trained student record to a browser bundle (`weights.q{bits}` +
+    /// `index.json`). Reads the Burn `.bin`/`.mpk` `video-train` writes — not
+    /// safetensors — closing the producer half of the deploy path.
+    Quantize {
+        #[arg(long)] spec: PathBuf,
+        #[arg(long)] weights: PathBuf,
+        #[arg(long)] output: PathBuf,
+        #[arg(long, default_value_t = 8)] bits: u8,
+    },
+}
+
+fn main() -> Result<()> {
+    match App::parse().command {
+        Command::ValidateCache { path } => {
+            let m = validate_cache(&path)?;
+            println!("validated {} shards from {}", m.shards.len(), m.teacher);
+        }
+        Command::Estimate { spec } => {
+            let s: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
+            s.validate()?;
+            println!("{}", s.approximate_parameters());
+        }
+        Command::Quantize { spec, weights, output, bits } => quantize(spec, weights, output, bits)?,
+    }
+    Ok(())
+}
+
+fn quantize(spec: PathBuf, weights: PathBuf, output: PathBuf, bits: u8) -> Result<()> {
+    if bits != 4 && bits != 8 { bail!("bits must be 4 or 8") }
+    let spec: StudentSpec = serde_json::from_slice(&fs::read(&spec)?)?;
+    spec.validate()?;
+    let device = NdArrayDevice::default();
+    let model = BrowserVideoStudent::<Cpu>::new(spec, &device);
+    // Burn's `load_file` wants the path without the recorder's extension.
+    let ext = weights.extension().and_then(|e| e.to_str()).unwrap_or("").to_owned();
+    let stem = weights.with_extension("");
+    let loaded = match ext.as_str() {
+        "mpk" => model.load_file(stem, &NamedMpkFileRecorder::<FullPrecisionSettings>::default(), &device),
+        "bin" | "" => model.load_file(stem, &BinFileRecorder::<FullPrecisionSettings>::default(), &device),
+        other => bail!("unknown weights format .{other}; expected .bin or .mpk"),
+    }
+    .map_err(|e| anyhow::anyhow!("load student record from {}: {e}", weights.display()))?;
+
+    let (blob, index) = quantize_module(&loaded, bits);
+    fs::create_dir_all(&output)?;
+    fs::write(output.join(format!("weights.q{bits}")), &blob)?;
+    fs::write(output.join("index.json"), serde_json::to_vec_pretty(&index)?)?;
+    println!("wrote {} tensors, {} bytes to {}", index.len(), blob.len(), output.display());
+    Ok(())
+}

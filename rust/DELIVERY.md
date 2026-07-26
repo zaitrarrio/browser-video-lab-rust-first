@@ -30,6 +30,14 @@ Its two real uses:
 
 ## Quantization is on the critical path, not polish
 
+> **Update — closed (Phase 1).** Both ends below are now wired. `video-cli
+> quantize --spec <spec> --weights <student.bin|.mpk>` walks the trained model in
+> Burn module order and writes `weights.q{bits}` + an ordered `index.json`;
+> `video-web::prepare_with_quantized` dequantizes it back onto a fresh model in
+> the same order, and `rust-video.ts` prefers a quantized bundle over
+> `student.bin`. Mapping is by order, not tensor name, so the two ends cannot
+> drift. The analysis below is retained as the original statement of the gap.
+
 `StudentSpec::approximate_parameters` gives **382,804,992** parameters for
 `browser-390m-umt5.json`. At `FullPrecisionSettings` that is:
 

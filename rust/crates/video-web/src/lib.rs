@@ -4,6 +4,7 @@ use burn::module::Module;
 use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::Tensor;
 use video_contract::StudentSpec;
+use video_student::quant::{dequantize_module, QTensor};
 use video_student::BrowserVideoStudent;
 use wasm_bindgen::prelude::*;
 
@@ -74,6 +75,21 @@ impl BrowserModel {
             .load(weights.to_vec(), &device)
             .map_err(|e| JsError::new(&format!("weight record: {e:?}")))?;
         self.model = Some(model.load_record(record));
+        self.trained = true;
+        Ok(())
+    }
+
+    /// Load a quantized bundle (`index.json` text + `weights.q{bits}` bytes)
+    /// produced by `video-cli quantize` — an int4 download is 8× smaller than the
+    /// f32 `student.bin`. The index is applied to a fresh model in module order,
+    /// dequantizing each tensor per its recorded scale.
+    pub async fn prepare_with_quantized(&mut self, index_json: &str, weights: &[u8]) -> Result<(), JsError> {
+        let index: Vec<QTensor> = serde_json::from_str(index_json)
+            .map_err(|e| JsError::new(&format!("index.json: {e}")))?;
+        let device = WgpuDevice::default();
+        init_setup_async::<WebGpu>(&device, RuntimeOptions::default()).await;
+        let model = BrowserVideoStudent::new(self.spec.clone(), &device);
+        self.model = Some(dequantize_module(model, &index, weights));
         self.trained = true;
         Ok(())
     }
