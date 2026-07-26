@@ -140,6 +140,15 @@ tracks; do not wire them together by accident.
 
 ## The prompt is not wired up
 
+> **Update — wired (Phase 3).** `BrowserModel::generate` now takes a
+> `[seq, text_width]` prompt embedding, and `src/runtime/rust-video.ts` encodes
+> the prompt (a real umt5-small ONNX encoder when `rust-video/text-encoder.json`
+> ships one, else a deterministic prompt-seeded embedding shared with the ONNX
+> student runtime) and passes it in. The prompt is no longer discarded; a real
+> encoder still has to be exported and shipped for semantic adherence, but the
+> plumbing is done and different prompts already change the output. The analysis
+> below is the original statement of the gap.
+
 `BrowserModel::generate` synthesizes its own latents *and* prompt embeddings from
 an LCG, and `rust-video.ts:75` names the argument `_prompt` because it is
 discarded. The demo cannot be prompted, whatever weights it loads.

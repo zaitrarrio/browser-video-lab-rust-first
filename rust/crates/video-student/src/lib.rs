@@ -92,5 +92,25 @@ mod tests {
         let diff: f32 = (y1 - y4).abs().sum().into_scalar();
         assert!(diff > 1e-4, "1-head and 4-head outputs identical (diff={diff}) — heads not used");
     }
+
+    // Prompt conditioning must actually reach the output: the same model and
+    // latents with two different prompt embeddings must denoise differently.
+    // If the prompt were ignored (as the demo did before Phase 3), the outputs
+    // would be identical.
+    #[test]
+    fn prompt_conditions_the_output() {
+        let device = NdArrayDevice::default();
+        let spec = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2] };
+        <Cpu as Backend>::seed(&device, 3);
+        let model = BrowserVideoStudent::<Cpu>::new(spec, &device);
+        let latents = Tensor::<Cpu, 1>::from_floats([0.3f32; 2 * 1 * 4 * 4].as_slice(), &device).reshape([1, 2, 1, 4, 4]);
+        let ts = Tensor::<Cpu, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
+        let prompt_a = Tensor::<Cpu, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+        let prompt_b = Tensor::<Cpu, 1>::from_floats([-0.7f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+        let (ya, _) = model.forward(latents.clone(), ts.clone(), prompt_a);
+        let (yb, _) = model.forward(latents, ts, prompt_b);
+        let diff: f32 = (ya - yb).abs().sum().into_scalar();
+        assert!(diff > 1e-4, "output identical for different prompts (diff={diff}) — prompt ignored");
+    }
 }
 

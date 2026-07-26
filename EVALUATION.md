@@ -66,9 +66,19 @@ and consumer can't drift), and `rust-video.ts` prefers a quantized bundle over
 spec. A unit test proves the bundle reconstructs the model's forward pass; a CI
 smoke proves the record→bundle wiring.
 
-Remaining for a promptable model: **Phase 3** (a browser umt5-small encoder,
-gap 5), and eventually **Phase 2** (a one-time teacher cache to make the weights
-*trained* rather than random — Plan B/Wan2.1 under the no-GPU constraint).
+**Phase 3 (prompt conditioning, gap 5) — done.** `BrowserModel::generate` no
+longer synthesizes prompt embeddings from an LCG and `rust-video.ts` no longer
+discards `_prompt`: the runtime encodes the prompt (a real umt5-small ONNX
+encoder when a `rust-video/text-encoder.json` manifest ships one, else a
+deterministic prompt-seeded embedding) and hands the `[seq, text_width]` tensor
+to the WASM student. The tokenize→encode path is shared with the ONNX student
+runtime, so typing a different prompt changes the output even before a real
+encoder is shipped. A unit test proves the student is genuinely conditioned on
+the prompt (different embeddings → different output).
+
+Remaining: **Phase 2** — a one-time teacher cache to make the weights *trained*
+rather than random (Plan B/Wan2.1 under the no-GPU constraint). After that the
+browser student is small, fast, promptable, and actually distilled.
 
 ### The teacher decision
 

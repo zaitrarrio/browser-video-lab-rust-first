@@ -110,7 +110,7 @@ impl BrowserModel {
     /// Run `steps` denoising iterations on a single `side`×`side` latent frame
     /// seeded by `seed`, then decode the first three latent channels to RGBA.
     /// Returns a `side*side*4` byte buffer (surfaced to JS as a `Uint8Array`).
-    pub async fn generate(&self, seed: u32, steps: u32, side: usize) -> Result<Vec<u8>, JsError> {
+    pub async fn generate(&self, seed: u32, steps: u32, side: usize, prompt_embeds: &[f32]) -> Result<Vec<u8>, JsError> {
         let model = self
             .model
             .as_ref()
@@ -118,7 +118,6 @@ impl BrowserModel {
         let device = WgpuDevice::default();
         let channels = self.spec.latent_channels;
         let text_width = self.spec.text_width;
-        let seq = 8usize;
         let [_pt, ph, pw] = self.spec.patch_size;
         if side % ph != 0 || side % pw != 0 {
             return Err(JsError::new(&format!(
@@ -135,13 +134,24 @@ impl BrowserModel {
             )));
         }
 
+        // Prompt conditioning: use the caller's `[seq, text_width]` embedding when
+        // supplied — a real umt5-small encoding or a deterministic prompt-seeded
+        // fallback from the runtime — so the model is genuinely conditioned on the
+        // prompt. A bare/mismatched call still runs by synthesizing an embedding.
+        let (prompt_vec, seq) = if !prompt_embeds.is_empty() && prompt_embeds.len() % text_width == 0 {
+            (prompt_embeds.to_vec(), prompt_embeds.len() / text_width)
+        } else {
+            let mut prng = Lcg::new(seed ^ 0x9e37_79b9);
+            let seq = 8usize;
+            ((0..seq * text_width).map(|_| prng.normal()).collect::<Vec<f32>>(), seq)
+        };
+
         let mut rng = Lcg::new(seed);
         let latent_seed: Vec<f32> = (0..channels * tokens).map(|_| rng.normal()).collect();
-        let prompt_seed: Vec<f32> = (0..seq * text_width).map(|_| rng.normal()).collect();
 
         let mut latents = Tensor::<Wgpu, 1>::from_floats(latent_seed.as_slice(), &device)
             .reshape([1, channels, 1, side, side]);
-        let prompt = Tensor::<Wgpu, 1>::from_floats(prompt_seed.as_slice(), &device)
+        let prompt = Tensor::<Wgpu, 1>::from_floats(prompt_vec.as_slice(), &device)
             .reshape([1, seq, text_width]);
 
         let steps = steps.max(1);
