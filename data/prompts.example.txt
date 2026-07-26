@@ -1,0 +1,21 @@
+# Example caption set for the teacher-cache build (data/prompts.example.txt).
+# One caption per line; blank lines and lines starting with '#' are ignored.
+# Point CAPTIONS_FILE (repo variable) at your own list for a real run — more,
+# more varied captions make a better student. Latents are sampled noise; the
+# timestep sweep in cache_teacher provides the supervision coverage.
+A cinematic tracking shot of a silver robot walking through Austin at sunset
+Waves crashing on a rocky shore under a stormy grey sky
+A hummingbird hovering beside a bright red flower, slow motion
+Time-lapse of clouds rolling over a snow-capped mountain range
+A neon-lit city street in the rain at night, reflections on the pavement
+A golden retriever running across a green field toward the camera
+Close-up of coffee being poured into a white ceramic cup, steam rising
+A hot air balloon drifting over a patchwork of farmland at dawn
+An astronaut floating inside a space station, Earth visible through the window
+A campfire crackling in a dark forest, sparks rising into the night
+A vintage train crossing a stone viaduct through rolling hills
+A school of fish turning together in clear turquoise water
+Autumn leaves falling in a quiet park, warm afternoon light
+A potter shaping clay on a spinning wheel, hands covered in slip
+Fireworks bursting over a river with a city skyline behind
+A lone lighthouse on a cliff as fog rolls in from the sea

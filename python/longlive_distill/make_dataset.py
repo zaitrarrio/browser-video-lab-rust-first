@@ -46,7 +46,10 @@ def synthetic(a):
 def encode(a):
     from transformers import AutoTokenizer, T5EncoderModel  # heavy; only the real path needs it
 
-    captions = [line.strip() for line in Path(a.captions).read_text().splitlines() if line.strip()]
+    captions = [line.strip() for line in Path(a.captions).read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")]
+    if a.limit:
+        captions = captions[:a.limit]
 
     def run(model_id: str, width: int):
         tok = AutoTokenizer.from_pretrained(model_id)
@@ -84,6 +87,7 @@ def main():
     p.add_argument("--teacher-encoder", default="google/umt5-xxl")
     p.add_argument("--student-encoder", default="google/umt5-small")
     p.add_argument("--latent-shape", type=int, nargs=4, default=[16, 4, 32, 48], metavar=("C", "T", "H", "W"))
+    p.add_argument("--limit", type=int, default=0, help="cap captions used (0 = all); real-encoder mode only")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     (synthetic if a.synthetic or not a.captions else encode)(a)

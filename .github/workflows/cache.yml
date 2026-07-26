@@ -1,0 +1,74 @@
+name: Build Teacher Cache
+
+# Builds the framework-neutral teacher-cache dataset on Kaggle's free CPU tier —
+# the one input the training pipeline (train.yml) used to need built by hand.
+#
+# The teacher pass is inference-only (Plan B: Wan2.1-1.3B, Apache-2.0), so it runs
+# on CPU and never competes with train.yml for the GPU quota. It encodes captions
+# with umT5-XXL (teacher) and umt5-small (student), runs the frozen teacher over
+# each (clip, draw), and versions the shards back as `<user>/<slug>-teacher-cache`,
+# which the trainer mounts on its next chunk.
+#
+# Manual by design — a teacher cache is built once (or when captions change), not
+# on a schedule. Same one-time setup as train.yml (see kaggle/README.md): repo
+# secrets KAGGLE_API_TOKEN (a KGAT_ token) and KAGGLE_USERNAME, and a
+# phone-verified Kaggle account so the kernel actually gets internet.
+on:
+  workflow_dispatch:
+    inputs:
+      caption_limit:
+        description: "Cap captions used (0 = all in the file)"
+        type: string
+        default: "0"
+      draws_per_clip:
+        description: "Independent (noise, timestep) draws per caption"
+        type: string
+        default: "8"
+      relation_layers:
+        description: "Relation-gram layers to cache per shard"
+        type: string
+        default: "6"
+
+# One cache build at a time: two would race on versioning the same dataset.
+concurrency:
+  group: teacher-cache
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KAGGLE_CLI_VERSION: "2.2.4"
+
+jobs:
+  build:
+    name: Build teacher cache on Kaggle CPU
+    runs-on: ubuntu-latest
+    # The CPU teacher pass is long; the kernel isn't wall-clock bounded, so this
+    # only caps how long we sit polling it (GitHub caps a job at 6h regardless).
+    timeout-minutes: 350
+    outputs:
+      shards: ${{ steps.cache.outputs.shards }}
+      teacher_dataset: ${{ steps.cache.outputs.teacher_dataset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Kaggle CLI
+        run: pipx install "kaggle==$KAGGLE_CLI_VERSION"
+      - name: Build teacher cache
+        id: cache
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          CAPTIONS_FILE: ${{ vars.CAPTIONS_FILE || 'data/prompts.example.txt' }}
+          LATENT_SHAPE: ${{ vars.LATENT_SHAPE || '16,4,32,48' }}
+          CAPTION_LIMIT: ${{ github.event.inputs.caption_limit || '0' }}
+          DRAWS_PER_CLIP: ${{ github.event.inputs.draws_per_clip || '8' }}
+          RELATION_LAYERS: ${{ github.event.inputs.relation_layers || '6' }}
+        run: node scripts/kaggle-cache.mjs
