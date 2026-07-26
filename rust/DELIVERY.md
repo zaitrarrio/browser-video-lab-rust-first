@@ -30,6 +30,14 @@ Its two real uses:
 
 ## Quantization is on the critical path, not polish
 
+> **Update — closed (Phase 1).** Both ends below are now wired. `video-cli
+> quantize --spec <spec> --weights <student.bin|.mpk>` walks the trained model in
+> Burn module order and writes `weights.q{bits}` + an ordered `index.json`;
+> `video-web::prepare_with_quantized` dequantizes it back onto a fresh model in
+> the same order, and `rust-video.ts` prefers a quantized bundle over
+> `student.bin`. Mapping is by order, not tensor name, so the two ends cannot
+> drift. The analysis below is retained as the original statement of the gap.
+
 `StudentSpec::approximate_parameters` gives **382,804,992** parameters for
 `browser-390m-umt5.json`. At `FullPrecisionSettings` that is:
 
@@ -78,6 +86,13 @@ teacher decision:
 
 ## The student does 16× the attention work of its own teacher
 
+> **Update — addressed (Phase 0).** The student now patchifies with `patch_size`
+> (default `[1,2,2]`): a `[1,4,4,32,48]` latent runs 1536 tokens instead of 6144,
+> and the relation grams line up with a Wan teacher. `latent_channels` is
+> reconciled to real VAE z-dims (16-ch Wan2.1 default, 48-ch Wan2.2 optional), and
+> the eager shard RAM load is replaced by a bounded lazy loader. The section below
+> is retained as the original analysis that motivated the change.
+
 Download size is one half of "will this run in a browser". The other half is
 tokens, and there is a large, free win sitting here.
 
@@ -124,6 +139,15 @@ tracks; do not wire them together by accident.
   does not match anything shipped.
 
 ## The prompt is not wired up
+
+> **Update — wired (Phase 3).** `BrowserModel::generate` now takes a
+> `[seq, text_width]` prompt embedding, and `src/runtime/rust-video.ts` encodes
+> the prompt (a real umt5-small ONNX encoder when `rust-video/text-encoder.json`
+> ships one, else a deterministic prompt-seeded embedding shared with the ONNX
+> student runtime) and passes it in. The prompt is no longer discarded; a real
+> encoder still has to be exported and shipped for semantic adherence, but the
+> plumbing is done and different prompts already change the output. The analysis
+> below is the original statement of the gap.
 
 `BrowserModel::generate` synthesizes its own latents *and* prompt embeddings from
 an LCG, and `rust-video.ts:75` names the argument `_prompt` because it is

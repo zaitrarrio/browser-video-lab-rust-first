@@ -22,6 +22,9 @@ enum Command {
         #[arg(long, default_value_t = 64)] teacher_text_width: usize,
         #[arg(long, default_value_t = 2)] relation_layers: usize,
         #[arg(long, default_value_t = 7)] seed: u32,
+        /// Independent (noise, timestep) draws emitted per clip. Total shards =
+        /// shards × draws-per-clip; effective supervision is the shard count.
+        #[arg(long, default_value_t = 1)] draws_per_clip: usize,
     },
     /// Distill the browser student from a teacher cache. PyTorch-free.
     Train {
@@ -47,19 +50,21 @@ enum Command {
         #[arg(long, default_value_t = 0)] max_seconds: u64,
         /// Total steps across every chunk (0 = this chunk is the whole run).
         #[arg(long, default_value_t = 0)] target_steps: usize,
+        /// Max decoded shards held resident by the lazy loader (bounds RAM).
+        #[arg(long, default_value_t = 128)] shard_cache: usize,
     },
 }
 
 fn main() -> Result<()> {
     match App::parse().command {
-        Command::SynthCache { spec, output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed } => {
+        Command::SynthCache { spec, output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed)?;
-            println!("wrote {shards} synthetic shards to {}", output.display());
+            synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip)?;
+            println!("wrote {} synthetic shards to {}", shards * draws_per_clip, output.display());
         }
-        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps } => {
+        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps };
+            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache };
             let (losses, state) = match backend.as_str() {
                 "ndarray" => train::<Autodiff<NdArray>>(spec, &cache, &output, &settings, &NdArrayDevice::default())?,
                 "wgpu" => train::<Autodiff<Wgpu>>(spec, &cache, &output, &settings, &WgpuDevice::default())?,

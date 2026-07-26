@@ -110,6 +110,26 @@ jobs:
             --output artifacts/train-smoke --backend ndarray --steps 10 --lr 0.01 --log-every 5
           test -f artifacts/train-smoke/student.bin
 
+      # Quantization producer gate: the trained Burn record must convert to an
+      # int8 and an int4 browser bundle, with int4 ~half the size. The consumer
+      # (dequantize → forward) is proven numerically by the video-student unit
+      # test in "Test model contracts & quantization" above; this proves the CLI
+      # wiring on a real record, no external checkpoint needed.
+      - name: Quantize round-trip smoke
+        run: |
+          for bits in 8 4; do
+            cargo run --manifest-path rust/Cargo.toml -p video-cli --locked -- \
+              quantize --spec rust/config/browser-smoke.json \
+              --weights artifacts/train-smoke/student.mpk \
+              --output "artifacts/qsmoke-q${bits}" --bits "${bits}"
+            test -f "artifacts/qsmoke-q${bits}/weights.q${bits}"
+            test -f "artifacts/qsmoke-q${bits}/index.json"
+          done
+          q8=$(stat -c%s artifacts/qsmoke-q8/weights.q8)
+          q4=$(stat -c%s artifacts/qsmoke-q4/weights.q4)
+          test "$q4" -le "$(( q8 / 2 + 1 ))" || { echo "int4 not ~half of int8: ${q4} vs ${q8}"; exit 1; }
+          echo "Quantize smoke: int8=${q8}B int4=${q4}B" >> "$GITHUB_STEP_SUMMARY"
+
       # Chunk-boundary gate for the free-GPU pipeline (see kaggle/README.md). The
       # unit tests prove resumption is numerically faithful; this proves the CLI
       # flags the Kaggle kernel actually passes are wired to it. A month-long run
@@ -166,30 +186,42 @@ jobs:
         if: steps.weights.outputs.cache-hit != 'true' && env.CHECKPOINT_URL != ''
         run: |
           mkdir -p artifacts
-          echo "Downloading checkpoint from ${CHECKPOINT_URL}"
-          curl -fSL "$CHECKPOINT_URL" -o artifacts/student.safetensors
+          echo "Downloading checkpoint (Burn record) from ${CHECKPOINT_URL}"
+          curl -fSL "$CHECKPOINT_URL" -o artifacts/checkpoint.mpk
 
       - name: Quantize weights (Q8 → Q4)
         if: steps.weights.outputs.cache-hit != 'true'
+        env:
+          SPEC: ${{ vars.CHECKPOINT_SPEC || 'rust/config/browser-390m-umt5.json' }}
         run: |
-          if [ -f artifacts/student.safetensors ]; then
+          if [ -f artifacts/checkpoint.mpk ]; then
             cargo run --release --manifest-path rust/Cargo.toml -p video-cli --locked -- \
-              quantize --input artifacts/student.safetensors --output artifacts/student-q8 --bits 8
+              quantize --spec "$SPEC" --weights artifacts/checkpoint.mpk --output artifacts/student-q8 --bits 8
             cargo run --release --manifest-path rust/Cargo.toml -p video-cli --locked -- \
-              quantize --input artifacts/student.safetensors --output artifacts/student-q4 --bits 4
+              quantize --spec "$SPEC" --weights artifacts/checkpoint.mpk --output artifacts/student-q4 --bits 4
           else
             echo "::notice::No checkpoint present — WASM runtime built, weight quantization skipped."
-            echo "Set the CHECKPOINT_URL repo variable to publish Q8/Q4 bundles." >> "$GITHUB_STEP_SUMMARY"
+            echo "Set the CHECKPOINT_URL (Burn .mpk record) repo variable to publish Q8/Q4 bundles." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # Assemble the publishable bundle from whatever weights exist.
       - name: Assemble model bundle
+        env:
+          SPEC: ${{ vars.CHECKPOINT_SPEC || 'rust/config/browser-390m-umt5.json' }}
         run: |
           mkdir -p model-bundle/rust-video
           cp -r public/rust-video/. model-bundle/rust-video/
           cp rust/config/browser-390m.json model-bundle/student-spec.json
           [ -d artifacts/student-q8 ] && cp -r artifacts/student-q8 model-bundle/student-q8 || true
           [ -d artifacts/student-q4 ] && cp -r artifacts/student-q4 model-bundle/student-q4 || true
+          # Serve the quantized bundle to the demo runtime (rust-video.ts prefers
+          # it over student.bin); Q4 wins when both exist, and the demo spec must
+          # match the quantized record.
+          src=artifacts/student-q4; [ -d "$src" ] || src=artifacts/student-q8
+          if [ -d "$src" ]; then
+            cp "$src"/index.json "$src"/weights.q* model-bundle/rust-video/
+            cp "$SPEC" model-bundle/rust-video/student-spec.json
+          fi
           node scripts/model-manifest.mjs model-bundle \
             --release "${{ github.sha }}" --out model-bundle/models-manifest.json
           cat model-bundle/models-manifest.json

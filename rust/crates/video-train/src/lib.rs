@@ -38,10 +38,13 @@ pub struct TrainSettings {
     pub max_seconds: u64,
     /// Total steps across all chunks; 0 = this chunk is the whole run.
     pub target_steps: usize,
+    /// Max decoded shards held resident by the lazy loader. Bounds RAM so shard
+    /// counts can grow into the thousands without loading the whole cache up front.
+    pub shard_cache: usize,
 }
 impl Default for TrainSettings {
     fn default() -> Self {
-        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0 }
+        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128 }
     }
 }
 
@@ -112,6 +115,38 @@ pub fn load_shard(path: &Path, relation_layers: &[usize]) -> Result<Sample> {
     })
 }
 
+/// Bounded, lazy shard loader. Keeps at most `cap` decoded shards resident and
+/// loads the rest on demand, so RAM stays flat as shard counts grow into the
+/// thousands — the eager `manifest.shards.iter().map(load_shard).collect()` it
+/// replaces did not. Shard selection stays a pure function of the global step
+/// (`(step-1) % len`), so a resumed chunked run draws the identical sequence as
+/// a single run (see `resumed_chunks_match_a_single_run`).
+struct ShardCache {
+    root: PathBuf,
+    shards: Vec<PathBuf>,
+    relation_layers: Vec<usize>,
+    cap: usize,
+    resident: std::collections::HashMap<usize, Sample>,
+    order: std::collections::VecDeque<usize>,
+}
+impl ShardCache {
+    fn new(root: PathBuf, shards: Vec<PathBuf>, relation_layers: Vec<usize>, cap: usize) -> Self {
+        Self { root, shards, relation_layers, cap: cap.max(1), resident: std::collections::HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+    fn len(&self) -> usize { self.shards.len() }
+    fn get(&mut self, idx: usize) -> Result<&Sample> {
+        if !self.resident.contains_key(&idx) {
+            let s = load_shard(&self.root.join(&self.shards[idx]), &self.relation_layers)?;
+            while self.order.len() >= self.cap {
+                match self.order.pop_front() { Some(old) => { self.resident.remove(&old); } None => break }
+            }
+            self.resident.insert(idx, s);
+            self.order.push_back(idx);
+        }
+        Ok(self.resident.get(&idx).expect("just inserted"))
+    }
+}
+
 fn t3<B: Backend>(x: &(Vec<f32>, [usize; 3]), device: &B::Device) -> Tensor<B, 3> {
     Tensor::<B, 1>::from_floats(x.0.as_slice(), device).reshape(x.1)
 }
@@ -140,8 +175,15 @@ pub struct StepMetrics { pub output: f32, pub temporal: f32, pub feature: f32, p
 pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s: &TrainSettings, device: &B::Device) -> Result<(Vec<f32>, TrainState)> {
     spec.validate()?;
     let manifest = validate_cache(cache)?;
-    let samples = manifest.shards.iter().map(|p| load_shard(&cache.join(p), &manifest.hidden_relation_layers)).collect::<Result<Vec<_>>>()?;
-    if samples.is_empty() { bail!("teacher cache has no shards") }
+    if manifest.shards.is_empty() { bail!("teacher cache has no shards") }
+    let mut shards = ShardCache::new(cache.to_path_buf(), manifest.shards.clone(), manifest.hidden_relation_layers.clone(), s.shard_cache);
+    let num_shards = shards.len();
+    // A channel-mismatched cache would otherwise fail deep inside the input Linear
+    // with an opaque shape error; catch it here where the fix is obvious.
+    let cache_channels = shards.get(0)?.noisy.1[1];
+    if cache_channels != spec.latent_channels {
+        bail!("cache latent_channels={} but spec expects {}", cache_channels, spec.latent_channels)
+    }
     fs::create_dir_all(out)?;
 
     let mpk = NamedMpkFileRecorder::<FullPrecisionSettings>::default();
@@ -191,7 +233,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     let mut history = Vec::with_capacity(chunk);
     for i in 1..=chunk {
         let step = start_step + i;
-        let sample = &samples[(step - 1) % samples.len()];
+        let sample = shards.get((step - 1) % num_shards)?;
         let noisy = t5::<B>(&sample.noisy, device);
         let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device).reshape([sample.timestep.len(), 1]);
         let prompt = t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
@@ -272,24 +314,40 @@ fn f16_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| half::f16::from_f32(*
 /// Write a tiny synthetic-but-contract-valid teacher cache so the whole
 /// train→save→load pipeline can run (and gate CI) with zero PyTorch and no GPU.
 /// Tensors are random: this validates plumbing, never model quality.
-pub fn synth_cache(spec: &StudentSpec, out: &Path, shards: usize, frames: usize, height: usize, width: usize, seq: usize, teacher_text_width: usize, relation_layers: usize, seed: u32) -> Result<()> {
+pub fn synth_cache(spec: &StudentSpec, out: &Path, clips: usize, frames: usize, height: usize, width: usize, seq: usize, teacher_text_width: usize, relation_layers: usize, seed: u32, draws_per_clip: usize) -> Result<()> {
     spec.validate()?;
-    let tokens = frames * height * width;
-    if tokens > spec.max_tokens { bail!("{tokens} tokens exceed spec.max_tokens={}", spec.max_tokens) }
-    if shards == 0 { bail!("need at least one shard") }
+    let [pt, ph, pw] = spec.patch_size;
+    if frames % pt != 0 || height % ph != 0 || width % pw != 0 {
+        bail!("cache geometry {frames}x{height}x{width} not divisible by patch_size {pt}x{ph}x{pw}")
+    }
+    // `cells` are the full latent positions carried in noisy_latents/teacher_pred;
+    // `tokens` are the post-patchify sequence length the student attends over and
+    // the side of each relation gram. max_tokens stays the pre-patch geometric budget.
+    let cells = frames * height * width;
+    let tokens = (frames / pt) * (height / ph) * (width / pw);
+    if cells > spec.max_tokens { bail!("{cells} latent cells exceed spec.max_tokens={}", spec.max_tokens) }
+    if clips == 0 { bail!("need at least one clip") }
+    if draws_per_clip == 0 { bail!("need at least one draw per clip") }
     fs::create_dir_all(out)?;
     let mut rng = Lcg::new(seed);
     let mut shard_names = Vec::new();
     let mut shapes: Vec<TensorShape> = Vec::new();
-    for i in 0..shards {
+    // Effective supervision is shard count, not step count (a shard's frozen
+    // (noise, timestep) is re-shown every time the cursor wraps). Emitting
+    // `draws_per_clip` shards per clip — each an independent (noise, timestep)
+    // draw — is what turns a handful of clips into a real dataset. Synthetic
+    // draws are just fresh random tensors; a real teacher would re-noise the same
+    // clip at a fresh timestep here.
+    let mut idx = 0usize;
+    for _clip in 0..clips { for _draw in 0..draws_per_clip {
         let c = spec.latent_channels;
         let entries: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = {
             let mut e = vec![
-                ("noisy_latents".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * tokens))),
-                ("timestep".into(), Dtype::I64, vec![1], ((i as i64 * 137) % 1000).to_le_bytes().to_vec()),
+                ("noisy_latents".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * cells))),
+                ("timestep".into(), Dtype::I64, vec![1], ((idx as i64 * 137) % 1000).to_le_bytes().to_vec()),
                 ("prompt_embeds".into(), Dtype::F32, vec![1, seq, teacher_text_width], f32_bytes(&rng.vec(seq * teacher_text_width))),
                 ("student_prompt_embeds".into(), Dtype::F32, vec![1, seq, spec.text_width], f32_bytes(&rng.vec(seq * spec.text_width))),
-                ("teacher_noise_pred".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * tokens))),
+                ("teacher_noise_pred".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * cells))),
             ];
             for layer in 0..relation_layers {
                 e.push((format!("teacher_relation.{layer}"), Dtype::F16, vec![1, tokens, tokens], f16_bytes(&rng.vec(tokens * tokens))));
@@ -297,11 +355,12 @@ pub fn synth_cache(spec: &StudentSpec, out: &Path, shards: usize, frames: usize,
             e
         };
         let views = entries.iter().map(|(name, dtype, shape, bytes)| Ok((name.clone(), TensorView::new(*dtype, shape.clone(), bytes)?))).collect::<Result<Vec<_>, safetensors::SafeTensorError>>()?;
-        let name = format!("shard-{i:06}.safetensors");
+        let name = format!("shard-{idx:06}.safetensors");
         safetensors::serialize_to_file(views, None, &out.join(&name))?;
         shard_names.push(PathBuf::from(name));
-        if i == 0 { shapes = entries.iter().map(|(name, dtype, shape, _)| TensorShape { name: name.clone(), shape: shape.clone(), dtype: format!("{dtype:?}").to_uppercase() }).collect(); }
-    }
+        if idx == 0 { shapes = entries.iter().map(|(name, dtype, shape, _)| TensorShape { name: name.clone(), shape: shape.clone(), dtype: format!("{dtype:?}").to_uppercase() }).collect(); }
+        idx += 1;
+    }}
     let manifest = TeacherCacheManifest {
         format_version: 1,
         teacher: "synthetic".into(),
@@ -322,7 +381,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     fn tiny_spec() -> StudentSpec {
-        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256 }
+        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256, patch_size: [1, 2, 2] }
     }
 
     // `Backend::seed` sets a *process-global* RNG, so two tests training on the
@@ -341,7 +400,7 @@ mod tests {
         let cache = dir.path().join("cache");
         let out = dir.path().join("run");
         let spec = tiny_spec();
-        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3).unwrap();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
         validate_cache(&cache).unwrap();
 
         let device = NdArrayDevice::default();
@@ -365,6 +424,10 @@ mod tests {
         let (pred, hidden) = model.forward(latents, timestep, prompt);
         assert_eq!(pred.dims(), [1, 2, 2, 4, 4]);
         assert_eq!(hidden.len(), 2);
+        // Patchify [1,2,2] on a 2×4×4 latent yields 2·2·2 = 8 tokens; the hidden
+        // relation gram proves the internal sequence length is the patchified 8,
+        // not the 32 an unpatchified flatten would produce.
+        assert_eq!(relation(hidden[0].clone()).dims(), [1, 8, 8]);
     }
 
     // Chunked training is the whole basis of the free-GPU pipeline: a 12h-capped
@@ -378,7 +441,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
         let spec = tiny_spec();
-        synth_cache(&spec, &cache, 3, 2, 4, 4, 4, 12, 2, 3).unwrap();
+        synth_cache(&spec, &cache, 3, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
         let device = NdArrayDevice::default();
         let base = || TrainSettings { lr: 1e-2, log_every: 100, ..Default::default() };
 
@@ -426,7 +489,7 @@ mod tests {
         let cache = dir.path().join("cache");
         let out = dir.path().join("run");
         let spec = tiny_spec();
-        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 5).unwrap();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 5, 1).unwrap();
         let settings = TrainSettings { steps: 100_000, target_steps: 100_000, max_seconds: 1, log_every: 100_000, ..Default::default() };
         let (losses, state) = train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &NdArrayDevice::default()).unwrap();
         assert_eq!(state.stopped_by, "max-seconds");
@@ -437,6 +500,45 @@ mod tests {
             assert!(out.join(f).exists(), "{f} missing after an early stop");
         }
         assert_eq!(TrainState::read(&out.join("state.json")).unwrap(), state);
+    }
+
+    // The lazy loader must return the correct shard for any index even when its
+    // resident capacity is smaller than the shard count — i.e. after eviction and
+    // reload. This is what lets a real run hold thousands of shards on disk while
+    // keeping only a bounded window in RAM.
+    #[test]
+    fn shard_cache_evicts_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        synth_cache(&tiny_spec(), &cache, 3, 2, 4, 4, 4, 12, 2, 7, 1).unwrap();
+        let manifest = validate_cache(&cache).unwrap();
+        let mut sc = ShardCache::new(cache.clone(), manifest.shards.clone(), manifest.hidden_relation_layers.clone(), 1);
+        assert_eq!(sc.len(), 3);
+        // Touch 0,1,2,0: with cap 1 every step but a repeat evicts, so index 0 is
+        // reloaded from disk on the last touch and must still be byte-identical.
+        for idx in [0usize, 1, 2, 0] {
+            let direct = load_shard(&cache.join(&manifest.shards[idx]), &manifest.hidden_relation_layers).unwrap();
+            let got = sc.get(idx).unwrap();
+            assert_eq!(got.noisy.1, direct.noisy.1);
+            assert_eq!(got.noisy.0, direct.noisy.0, "shard {idx} decoded differently after reload");
+        }
+        assert!(sc.resident.len() <= 1, "cap=1 must keep at most one shard resident, got {}", sc.resident.len());
+    }
+
+    // draws_per_clip multiplies clips into independent (noise, timestep) shards —
+    // the mechanism that turns a few clips into enough supervision to train on.
+    #[test]
+    fn draws_per_clip_multiplies_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        synth_cache(&tiny_spec(), &cache, 3, 2, 4, 4, 4, 12, 2, 7, 4).unwrap();
+        let manifest = validate_cache(&cache).unwrap();
+        assert_eq!(manifest.shards.len(), 12, "3 clips × 4 draws = 12 shards");
+        // Distinct timestep draws: the first four shards must not all share a t.
+        let ts: Vec<Vec<f32>> = manifest.shards.iter().take(4)
+            .map(|p| load_shard(&cache.join(p), &manifest.hidden_relation_layers).unwrap().timestep)
+            .collect();
+        assert!(ts.iter().any(|t| t != &ts[0]), "draws within reach must vary the timestep");
     }
 
     #[test]

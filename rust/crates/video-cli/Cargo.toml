@@ -5,11 +5,10 @@ edition.workspace = true
 license.workspace = true
 [dependencies]
 anyhow.workspace = true
-bytemuck.workspace = true
+burn = { workspace = true, features = ["ndarray"] }
 clap.workspace = true
-half.workspace = true
-safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 video-contract = { path = "../video-contract" }
+video-student = { path = "../video-student" }
 

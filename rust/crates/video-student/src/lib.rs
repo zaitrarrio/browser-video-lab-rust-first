@@ -1,6 +1,8 @@
 use burn::{nn::{Gelu, LayerNorm, LayerNormConfig, Linear, LinearConfig}, prelude::*};
 use video_contract::StudentSpec;
 
+pub mod quant;
+
 #[derive(Module, Debug)]
 pub struct MixerBlock<B: Backend> {
     norm: LayerNorm<B>, q: Linear<B>, k: Linear<B>, v: Linear<B>, proj: Linear<B>,
@@ -33,12 +35,26 @@ pub struct BrowserVideoStudent<B: Backend> {
     input: Linear<B>, text: Linear<B>, time: Linear<B>, blocks: Vec<MixerBlock<B>>, norm: LayerNorm<B>, output: Linear<B>, spec: StudentSpec,
 }
 impl<B: Backend> BrowserVideoStudent<B> {
-    pub fn new(spec: StudentSpec, device:&B::Device)->Self { spec.validate().expect("valid spec"); Self {
-        input:LinearConfig::new(spec.latent_channels,spec.width).init(device),text:LinearConfig::new(spec.text_width,spec.width).init(device),time:LinearConfig::new(1,spec.width).init(device),
-        blocks:(0..spec.layers).map(|_|MixerBlock::new(spec.width,spec.mlp_ratio,device)).collect(),norm:LayerNormConfig::new(spec.width).init(device),output:LinearConfig::new(spec.width,spec.latent_channels).init(device),spec,
+    pub fn new(spec: StudentSpec, device:&B::Device)->Self { spec.validate().expect("valid spec"); let token=spec.latent_channels*spec.patch_volume(); Self {
+        input:LinearConfig::new(token,spec.width).init(device),text:LinearConfig::new(spec.text_width,spec.width).init(device),time:LinearConfig::new(1,spec.width).init(device),
+        blocks:(0..spec.layers).map(|_|MixerBlock::new(spec.width,spec.mlp_ratio,device)).collect(),norm:LayerNormConfig::new(spec.width).init(device),output:LinearConfig::new(spec.width,token).init(device),spec,
     }}
+    // Patchify `[b,c,t,h,w]` into `t·(h/ph)·(w/pw)` tokens of `c·ph·pw` (Wan uses
+    // patch_size [1,2,2]), run the mixer, then unpatchify back to full latent
+    // resolution. Patchify is what makes the student's token count — and its
+    // relation grams — match a real Wan teacher; the flatten it replaces did not.
     pub fn forward(&self, latents:Tensor<B,5>, timestep:Tensor<B,2>, prompt:Tensor<B,3>)->(Tensor<B,5>,Vec<Tensor<B,3>>){
-        let [b,c,t,h,w]=latents.dims();let mut x=latents.swap_dims(1,4).reshape([b,t*h*w,c]);let cond=self.text.forward(prompt.mean_dim(1))+self.time.forward(timestep/1000.0).unsqueeze_dim(1);x=self.input.forward(x)+cond;let mut hidden=Vec::with_capacity(self.blocks.len());for block in &self.blocks{x=block.forward(x,self.spec.heads);hidden.push(x.clone())}let y=self.output.forward(self.norm.forward(x)).reshape([b,w,t,h,c]).swap_dims(1,4);(y,hidden)
+        let [b,c,t,h,w]=latents.dims();let [pt,ph,pw]=self.spec.patch_size; // pt==1 (validated)
+        assert!(t%pt==0&&h%ph==0&&w%pw==0,"latent {t}x{h}x{w} not divisible by patch_size {pt}x{ph}x{pw}");
+        let (hp,wp)=(h/ph,w/pw);let tokens=t*hp*wp;let pv=c*ph*pw;
+        // Patchify staying within the NdArray 6-dim ceiling: fold b·t, split h/w in
+        // one reshape, group spatial patch cells (c,ph,pw) into the token vector.
+        // [b,t,c,hp,ph,wp,pw]→permute→[b·t,hp,wp,c,ph,pw]→[b, t·hp·wp, c·ph·pw]
+        let mut x=latents.swap_dims(1,2).reshape([b*t,c,hp,ph,wp,pw]).permute([0,2,4,1,3,5]).reshape([b,tokens,pv]);
+        let cond=self.text.forward(prompt.mean_dim(1))+self.time.forward(timestep/1000.0).unsqueeze_dim(1);x=self.input.forward(x)+cond;
+        let mut hidden=Vec::with_capacity(self.blocks.len());for block in &self.blocks{x=block.forward(x,self.spec.heads);hidden.push(x.clone())}
+        // Inverse patchify back to [b,c,t,h,w] (same 6-dim ceiling).
+        let y=self.output.forward(self.norm.forward(x)).reshape([b*t,hp,wp,c,ph,pw]).permute([0,3,1,4,2,5]).reshape([b,t,c,h,w]).swap_dims(1,2);(y,hidden)
     }
 }
 
@@ -59,20 +75,42 @@ mod tests {
     #[test]
     fn heads_are_actually_used() {
         let device = NdArrayDevice::default();
-        let base = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 1, mlp_ratio: 2, max_tokens: 64 };
+        // 4×4 latent → 2×2 = 4 tokens after patch_size [1,2,2]; multi-head only
+        // matters with more than one token, so keep post-patch tokens > 1.
+        let base = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 1, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2] };
         let multi = StudentSpec { heads: 4, ..base.clone() };
         // Same seed → identical initial weights; only `heads` differs.
         <Cpu as Backend>::seed(&device, 7);
         let m1 = BrowserVideoStudent::<Cpu>::new(base, &device);
         <Cpu as Backend>::seed(&device, 7);
         let m4 = BrowserVideoStudent::<Cpu>::new(multi, &device);
-        let latents = Tensor::<Cpu, 1>::from_floats([0.3f32; 2 * 1 * 2 * 2].as_slice(), &device).reshape([1, 2, 1, 2, 2]);
+        let latents = Tensor::<Cpu, 1>::from_floats([0.3f32; 2 * 1 * 4 * 4].as_slice(), &device).reshape([1, 2, 1, 4, 4]);
         let ts = Tensor::<Cpu, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
         let prompt = Tensor::<Cpu, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
         let (y1, _) = m1.forward(latents.clone(), ts.clone(), prompt.clone());
         let (y4, _) = m4.forward(latents, ts, prompt);
         let diff: f32 = (y1 - y4).abs().sum().into_scalar();
         assert!(diff > 1e-4, "1-head and 4-head outputs identical (diff={diff}) — heads not used");
+    }
+
+    // Prompt conditioning must actually reach the output: the same model and
+    // latents with two different prompt embeddings must denoise differently.
+    // If the prompt were ignored (as the demo did before Phase 3), the outputs
+    // would be identical.
+    #[test]
+    fn prompt_conditions_the_output() {
+        let device = NdArrayDevice::default();
+        let spec = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2] };
+        <Cpu as Backend>::seed(&device, 3);
+        let model = BrowserVideoStudent::<Cpu>::new(spec, &device);
+        let latents = Tensor::<Cpu, 1>::from_floats([0.3f32; 2 * 1 * 4 * 4].as_slice(), &device).reshape([1, 2, 1, 4, 4]);
+        let ts = Tensor::<Cpu, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
+        let prompt_a = Tensor::<Cpu, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+        let prompt_b = Tensor::<Cpu, 1>::from_floats([-0.7f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+        let (ya, _) = model.forward(latents.clone(), ts.clone(), prompt_a);
+        let (yb, _) = model.forward(latents, ts, prompt_b);
+        let diff: f32 = (ya - yb).abs().sum().into_scalar();
+        assert!(diff > 1e-4, "output identical for different prompts (diff={diff}) — prompt ignored");
     }
 }
 

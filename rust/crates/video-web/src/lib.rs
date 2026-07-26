@@ -4,6 +4,7 @@ use burn::module::Module;
 use burn::record::{BinBytesRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::Tensor;
 use video_contract::StudentSpec;
+use video_student::quant::{dequantize_module, QTensor};
 use video_student::BrowserVideoStudent;
 use wasm_bindgen::prelude::*;
 
@@ -78,6 +79,21 @@ impl BrowserModel {
         Ok(())
     }
 
+    /// Load a quantized bundle (`index.json` text + `weights.q{bits}` bytes)
+    /// produced by `video-cli quantize` — an int4 download is 8× smaller than the
+    /// f32 `student.bin`. The index is applied to a fresh model in module order,
+    /// dequantizing each tensor per its recorded scale.
+    pub async fn prepare_with_quantized(&mut self, index_json: &str, weights: &[u8]) -> Result<(), JsError> {
+        let index: Vec<QTensor> = serde_json::from_str(index_json)
+            .map_err(|e| JsError::new(&format!("index.json: {e}")))?;
+        let device = WgpuDevice::default();
+        init_setup_async::<WebGpu>(&device, RuntimeOptions::default()).await;
+        let model = BrowserVideoStudent::new(self.spec.clone(), &device);
+        self.model = Some(dequantize_module(model, &index, weights));
+        self.trained = true;
+        Ok(())
+    }
+
     /// Whether the current model carries trained weights (vs random init).
     pub fn trained(&self) -> bool {
         self.trained
@@ -94,7 +110,7 @@ impl BrowserModel {
     /// Run `steps` denoising iterations on a single `side`×`side` latent frame
     /// seeded by `seed`, then decode the first three latent channels to RGBA.
     /// Returns a `side*side*4` byte buffer (surfaced to JS as a `Uint8Array`).
-    pub async fn generate(&self, seed: u32, steps: u32, side: usize) -> Result<Vec<u8>, JsError> {
+    pub async fn generate(&self, seed: u32, steps: u32, side: usize, prompt_embeds: &[f32]) -> Result<Vec<u8>, JsError> {
         let model = self
             .model
             .as_ref()
@@ -102,22 +118,40 @@ impl BrowserModel {
         let device = WgpuDevice::default();
         let channels = self.spec.latent_channels;
         let text_width = self.spec.text_width;
-        let seq = 8usize;
+        let [_pt, ph, pw] = self.spec.patch_size;
+        if side % ph != 0 || side % pw != 0 {
+            return Err(JsError::new(&format!(
+                "side={side} not divisible by patch_size {ph}x{pw}"
+            )));
+        }
+        // max_tokens is the pre-patch geometric budget; actual attention runs over
+        // side²/(ph·pw) tokens after patchify.
         let tokens = side * side;
         if tokens > self.spec.max_tokens {
             return Err(JsError::new(&format!(
-                "side={side} yields {tokens} tokens > spec.max_tokens={}",
+                "side={side} yields {tokens} latent cells > spec.max_tokens={}",
                 self.spec.max_tokens
             )));
         }
 
+        // Prompt conditioning: use the caller's `[seq, text_width]` embedding when
+        // supplied — a real umt5-small encoding or a deterministic prompt-seeded
+        // fallback from the runtime — so the model is genuinely conditioned on the
+        // prompt. A bare/mismatched call still runs by synthesizing an embedding.
+        let (prompt_vec, seq) = if !prompt_embeds.is_empty() && prompt_embeds.len() % text_width == 0 {
+            (prompt_embeds.to_vec(), prompt_embeds.len() / text_width)
+        } else {
+            let mut prng = Lcg::new(seed ^ 0x9e37_79b9);
+            let seq = 8usize;
+            ((0..seq * text_width).map(|_| prng.normal()).collect::<Vec<f32>>(), seq)
+        };
+
         let mut rng = Lcg::new(seed);
         let latent_seed: Vec<f32> = (0..channels * tokens).map(|_| rng.normal()).collect();
-        let prompt_seed: Vec<f32> = (0..seq * text_width).map(|_| rng.normal()).collect();
 
         let mut latents = Tensor::<Wgpu, 1>::from_floats(latent_seed.as_slice(), &device)
             .reshape([1, channels, 1, side, side]);
-        let prompt = Tensor::<Wgpu, 1>::from_floats(prompt_seed.as_slice(), &device)
+        let prompt = Tensor::<Wgpu, 1>::from_floats(prompt_vec.as_slice(), &device)
             .reshape([1, seq, text_width]);
 
         let steps = steps.max(1);

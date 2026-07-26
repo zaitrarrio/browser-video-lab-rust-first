@@ -333,3 +333,55 @@ Note for step 5: the demo cannot currently be prompted. `video-web::generate`
 synthesizes prompt embeddings from an LCG and `src/runtime/rust-video.ts` ignores
 the prompt string. Wiring a real umt5-small encoder into the browser is separate
 work, and no amount of teacher quality substitutes for it.
+
+---
+
+## Plan B — implemented (Phase 2)
+
+The cache-format work and the Plan B teacher path are now in the tree, CPU-only:
+
+- `python/wan21_teacher_adapter.py` — `build_teacher({...})` loads the real
+  `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` transformer and hooks its blocks for
+  `hidden_states` (post-patchify tokens, so the grams line up with the patchified
+  Burn student). `build_teacher({"toy": true})` is a tiny CPU stand-in that
+  patchifies with the same geometry, exercising the whole path with no download.
+- `longlive_distill/make_dataset.py` — builds the `.pt` items (latents,
+  `prompt_embeds`, `student_prompt_embeds`). `--synthetic` needs no downloads;
+  the default encodes a captions file with umT5-XXL (teacher, 4096) and
+  umt5-small (student, 512).
+- `longlive_distill/cache_teacher.py` — now adapter-driven and device-flexible,
+  with `--draws-per-clip`, `--relation-layers` (cap), and `student_prompt_embeds`
+  passthrough: the three TEACHER-OPTIONS cache-format changes.
+
+**Prove it end to end on CPU (no GPU, no weights):**
+
+```bash
+task teacher:cache:smoke   # synthetic dataset -> toy teacher cache -> Rust validate-cache
+task teacher:test          # Python contract tests
+```
+
+The produced cache trains the Burn student directly:
+
+```bash
+cargo run --manifest-path rust/Cargo.toml -p video-train -- \
+  train --spec rust/config/browser-smoke.json --cache artifacts/wan-cache \
+  --output artifacts/wan-train --backend ndarray --steps 12 --lr 0.01
+```
+
+**Real run (rented CPU / Kaggle CPU kernel).** Install `requirements-wan.txt`
+(`diffusers`, `transformers`), then:
+
+```bash
+# 1. encode captions -> .pt items (both encoder widths)
+python -m longlive_distill.make_dataset --captions prompts.txt \
+  --output data/wan-latents --latent-shape 16 4 32 48
+# 2. cache the frozen Wan2.1 teacher on CPU (8 draws/clip, 6 relation layers)
+task teacher:cache:wan21 DATASET=data/wan-latents
+# 3. train the Rust student on data/teacher-cache (spec: browser-390m-umt5.json)
+```
+
+**Confirm before the real run:** time one teacher forward pass on a single sample
+(CPU throughput for a 1.3B DiT is the one unmeasured risk), and confirm the
+`diffusers` forward kwargs the adapter assumes (annotated in
+`wan21_teacher_adapter.py`) against the pinned release. Token subsampling (a size
+optimization) stays deferred: patchify already aligns the grams.
