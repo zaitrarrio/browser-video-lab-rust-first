@@ -8,13 +8,14 @@
 // (rust/config/browser-390m.json) is far too heavy to random-init in a tab, so
 // the demo defaults to this and only overrides it if a spec URL is reachable.
 const DEMO_SPEC = {
-  latent_channels: 4,
+  latent_channels: 16,
   text_width: 64,
   width: 192,
   layers: 4,
   heads: 6,
   mlp_ratio: 2,
   max_tokens: 8192,
+  patch_size: [1, 2, 2],
 };
 
 // Latent side length; the decoded frame is SIDE×SIDE. Keep SIDE*SIDE within the

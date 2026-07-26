@@ -92,7 +92,7 @@ tasks:
     cmds: [cargo test --manifest-path rust/Cargo.toml --workspace]
   rust:estimate:
     desc: Print the approximate browser-student parameter count
-    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- estimate --spec rust/config/browser-390m.json]
+    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- estimate rust/config/browser-390m.json]
   rust:validate-cache:
     desc: Validate framework-neutral teacher shards
     cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache --path data/teacher-cache]

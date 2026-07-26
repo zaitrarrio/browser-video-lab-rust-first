@@ -142,6 +142,11 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     let manifest = validate_cache(cache)?;
     let samples = manifest.shards.iter().map(|p| load_shard(&cache.join(p), &manifest.hidden_relation_layers)).collect::<Result<Vec<_>>>()?;
     if samples.is_empty() { bail!("teacher cache has no shards") }
+    // A channel-mismatched cache would otherwise fail deep inside the input Linear
+    // with an opaque shape error; catch it here where the fix is obvious.
+    if samples[0].noisy.1[1] != spec.latent_channels {
+        bail!("cache latent_channels={} but spec expects {}", samples[0].noisy.1[1], spec.latent_channels)
+    }
     fs::create_dir_all(out)?;
 
     let mpk = NamedMpkFileRecorder::<FullPrecisionSettings>::default();
@@ -274,8 +279,16 @@ fn f16_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| half::f16::from_f32(*
 /// Tensors are random: this validates plumbing, never model quality.
 pub fn synth_cache(spec: &StudentSpec, out: &Path, shards: usize, frames: usize, height: usize, width: usize, seq: usize, teacher_text_width: usize, relation_layers: usize, seed: u32) -> Result<()> {
     spec.validate()?;
-    let tokens = frames * height * width;
-    if tokens > spec.max_tokens { bail!("{tokens} tokens exceed spec.max_tokens={}", spec.max_tokens) }
+    let [pt, ph, pw] = spec.patch_size;
+    if frames % pt != 0 || height % ph != 0 || width % pw != 0 {
+        bail!("cache geometry {frames}x{height}x{width} not divisible by patch_size {pt}x{ph}x{pw}")
+    }
+    // `cells` are the full latent positions carried in noisy_latents/teacher_pred;
+    // `tokens` are the post-patchify sequence length the student attends over and
+    // the side of each relation gram. max_tokens stays the pre-patch geometric budget.
+    let cells = frames * height * width;
+    let tokens = (frames / pt) * (height / ph) * (width / pw);
+    if cells > spec.max_tokens { bail!("{cells} latent cells exceed spec.max_tokens={}", spec.max_tokens) }
     if shards == 0 { bail!("need at least one shard") }
     fs::create_dir_all(out)?;
     let mut rng = Lcg::new(seed);
@@ -285,11 +298,11 @@ pub fn synth_cache(spec: &StudentSpec, out: &Path, shards: usize, frames: usize,
         let c = spec.latent_channels;
         let entries: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = {
             let mut e = vec![
-                ("noisy_latents".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * tokens))),
+                ("noisy_latents".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * cells))),
                 ("timestep".into(), Dtype::I64, vec![1], ((i as i64 * 137) % 1000).to_le_bytes().to_vec()),
                 ("prompt_embeds".into(), Dtype::F32, vec![1, seq, teacher_text_width], f32_bytes(&rng.vec(seq * teacher_text_width))),
                 ("student_prompt_embeds".into(), Dtype::F32, vec![1, seq, spec.text_width], f32_bytes(&rng.vec(seq * spec.text_width))),
-                ("teacher_noise_pred".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * tokens))),
+                ("teacher_noise_pred".into(), Dtype::F32, vec![1, c, frames, height, width], f32_bytes(&rng.vec(c * cells))),
             ];
             for layer in 0..relation_layers {
                 e.push((format!("teacher_relation.{layer}"), Dtype::F16, vec![1, tokens, tokens], f16_bytes(&rng.vec(tokens * tokens))));
@@ -322,7 +335,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     fn tiny_spec() -> StudentSpec {
-        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256 }
+        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256, patch_size: [1, 2, 2] }
     }
 
     // `Backend::seed` sets a *process-global* RNG, so two tests training on the
@@ -365,6 +378,10 @@ mod tests {
         let (pred, hidden) = model.forward(latents, timestep, prompt);
         assert_eq!(pred.dims(), [1, 2, 2, 4, 4]);
         assert_eq!(hidden.len(), 2);
+        // Patchify [1,2,2] on a 2×4×4 latent yields 2·2·2 = 8 tokens; the hidden
+        // relation gram proves the internal sequence length is the patchified 8,
+        // not the 32 an unpatchified flatten would produce.
+        assert_eq!(relation(hidden[0].clone()).dims(), [1, 8, 8]);
     }
 
     // Chunked training is the whole basis of the free-GPU pipeline: a 12h-capped

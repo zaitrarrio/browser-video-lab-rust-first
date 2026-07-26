@@ -103,10 +103,18 @@ impl BrowserModel {
         let channels = self.spec.latent_channels;
         let text_width = self.spec.text_width;
         let seq = 8usize;
+        let [_pt, ph, pw] = self.spec.patch_size;
+        if side % ph != 0 || side % pw != 0 {
+            return Err(JsError::new(&format!(
+                "side={side} not divisible by patch_size {ph}x{pw}"
+            )));
+        }
+        // max_tokens is the pre-patch geometric budget; actual attention runs over
+        // side²/(ph·pw) tokens after patchify.
         let tokens = side * side;
         if tokens > self.spec.max_tokens {
             return Err(JsError::new(&format!(
-                "side={side} yields {tokens} tokens > spec.max_tokens={}",
+                "side={side} yields {tokens} latent cells > spec.max_tokens={}",
                 self.spec.max_tokens
             )));
         }
