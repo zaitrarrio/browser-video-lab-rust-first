@@ -25,7 +25,7 @@ Three caches, each a Kaggle dataset, each skipped entirely on a hit:
 | dataset | holds | key | cost of a miss |
 |---|---|---|---|
 | `…-toolchain` | prebuilt `video-train` | sha256 of `rust/**` | ~20 min of cargo |
-| `…-teacher-cache` | safetensors shards | built once by hand | a full teacher pass |
+| `…-teacher-cache` | safetensors shards | built by `cache.yml` (Kaggle CPU) | a full teacher pass |
 | `…-checkpoint` | `student.mpk`, `optim.mpk`, `state.json` | n/a — always resumed | the whole run |
 
 Weights are versioned back from *inside* the kernel, so multi-GB checkpoints
@@ -56,15 +56,23 @@ Past `--target-steps` a chunk is a no-op, so an over-eager cron cannot overtrain
    internet and no GPU, *regardless of what the kernel metadata asks for*: the
    push is accepted, `enable_internet` reads back as true, and the session then
    fails at the first DNS lookup. `require_internet()` names this on sight.
-4. **Teacher cache** — produce it once and upload it as
-   `<user>/browser-video-student-chunk-teacher-cache`:
+4. **Teacher cache** — build it on Kaggle's CPU tier, no manual upload:
 
    ```sh
-   task teacher:cache TEACHER_ADAPTER=pkg.mod:build_teacher DATASET=data/clips
-   kaggle datasets create -p data/teacher-cache --dir-mode zip
+   gh workflow run cache.yml         # optionally -f caption_limit=32 -f draws_per_clip=8
    ```
 
-   Without it the pipeline refuses to run unless you explicitly pass
+   `cache.yml` runs `kaggle/cache_chunk.py` (the CPU sibling of `run_chunk.py`,
+   driven by `scripts/kaggle-cache.mjs`): it encodes captions with umT5-XXL and
+   umt5-small, runs the frozen **Wan2.1-1.3B** teacher (Plan B, Apache-2.0) over
+   each `(clip, draw)`, and versions the shards as
+   `<user>/browser-video-student-chunk-teacher-cache` — exactly the dataset the
+   trainer mounts. Point the `CAPTIONS_FILE` repo variable at your own prompt list
+   (default `data/prompts.example.txt`); more, more varied captions make a better
+   student. To build it by hand instead, use `task teacher:cache:wan21` locally
+   and `kaggle datasets create`.
+
+   Without the cache the trainer refuses to run unless you explicitly pass
    `allow_synthetic_teacher`, which trains on random tensors: it exercises the
    full GPU path and produces a *running* student, never a good one.
 

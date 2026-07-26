@@ -159,6 +159,12 @@ jobs:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: node scripts/kaggle-orchestrate.mjs --dry-run
 
+      - name: Validate Kaggle teacher-cache kernel
+        env:
+          KAGGLE_USERNAME: ci
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: node scripts/kaggle-cache.mjs --dry-run
+
       # Layer 2: content-addressed cache of the produced weight bundle. Keyed on
       # the Rust sources + configs + checkpoint URL, so weights are reused across
       # runs whenever nothing that affects them changed.
