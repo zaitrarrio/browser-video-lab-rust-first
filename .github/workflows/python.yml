@@ -20,6 +20,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: python/requirements-distill.txt
       - name: Install CPU deps
         # CPU-only torch keeps the job small; the tests need nothing else heavy.
         run: |
