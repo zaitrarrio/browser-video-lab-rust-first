@@ -70,6 +70,10 @@ const CONFIG = {
   target_steps: Number(env("TARGET_STEPS", "200000")),
   lr: Number(env("TRAIN_LR", "1e-4")),
   log_every: Number(env("LOG_EVERY", "200")),
+  // A full resumable checkpoint this often. The cost is one save per interval;
+  // the alternative is what an end-of-chunk-only save cost on the first real run,
+  // which was every step of a 7.5-hour chunk.
+  ckpt_every: Number(env("CKPT_EVERY", "1000")),
   // Kaggle hard-stops a GPU session at 12h; stop the trainer before that so the
   // checkpoint is written by us rather than lost to the reaper.
   session_seconds: Number(env("SESSION_SECONDS", String(11 * 3600))),

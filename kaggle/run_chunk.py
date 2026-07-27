@@ -206,14 +206,34 @@ def main():
         f'--max-seconds {budget}',
         f'--lr {CONFIG["lr"]}',
         f'--log-every {CONFIG["log_every"]}',
+        f'--ckpt-every {CONFIG["ckpt_every"]}',
     ]
     if resume:
         args.append(f'--resume "{resume}"')
-    sh(" ".join(args), cwd=REPO)
+
+    # Deliberately not check=True. The trainer checkpoints on a cadence, and those
+    # checkpoints only become progress once they reach the dataset — so a crash
+    # must still push whatever reached disk. Failing before the push is how a
+    # 7.5-hour chunk previously ended with nothing to resume from.
+    completed = sh(" ".join(args), cwd=REPO, check=False)
+
+    if not (RUN / "state.json").exists():
+        raise SystemExit(
+            f"trainer exited {completed.returncode} before writing any checkpoint — "
+            "nothing to push. See the log above; with --ckpt-every set, this means it "
+            "failed inside the first interval."
+        )
 
     state = json.loads((RUN / "state.json").read_text())
+    note = "" if completed.returncode == 0 else f" (trainer exited {completed.returncode})"
     push_dataset(RUN, CONFIG["checkpoint_dataset"], CONFIG["checkpoint_title"],
-                 f'step {state["steps_done"]}/{state["target_steps"]} loss {state["last_loss"]:.6f}')
+                 f'step {state["steps_done"]}/{state["target_steps"]} loss {state["last_loss"]:.6f}{note}')
+
+    if completed.returncode != 0:
+        raise SystemExit(
+            f"trainer failed with exit {completed.returncode}, but its step-{state['steps_done']} "
+            "checkpoint was pushed — the next chunk resumes from there rather than from zero."
+        )
 
     # Leave only metadata in the kernel output: the orchestrator polls this, and
     # pulling multi-GB weights back through CI would dwarf the training itself.

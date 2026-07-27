@@ -13,7 +13,7 @@ use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{backend::Backend, ElementConversion, Tensor};
 use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::{Path, PathBuf}, time::Instant};
+use std::{fs, io::Write, path::{Path, PathBuf}, time::Instant};
 use video_contract::{validate_cache, StudentSpec, TeacherCacheManifest, TensorShape};
 use video_student::{relation, temporal_difference, BrowserVideoStudent};
 
@@ -164,6 +164,35 @@ fn linspace_idx(len: usize, pairs: usize) -> Vec<usize> {
 
 pub struct StepMetrics { pub output: f32, pub temporal: f32, pub feature: f32, pub total: f32 }
 
+/// Write a *complete*, resumable checkpoint: weights, AdamW moments and run state.
+///
+/// All four files together are what `--resume` needs; any subset is a run that
+/// silently restarts something. Called on a cadence as well as at the end,
+/// because a chunk that dies at step 19,999 with nothing on disk has burned
+/// hours of GPU for no progress — which is exactly what a 20,000-step chunk with
+/// an end-only save did on Kaggle.
+fn write_checkpoint<B, O>(
+    out: &Path,
+    model: &BrowserVideoStudent<B>,
+    optim: &O,
+    state: &TrainState,
+    mpk: &NamedMpkFileRecorder<FullPrecisionSettings>,
+) -> Result<()>
+where
+    B: AutodiffBackend,
+    O: Optimizer<BrowserVideoStudent<B>, B>,
+{
+    let trained = model.valid();
+    trained.clone().save_file(out.join("student"), mpk).context("save student.mpk")?;
+    trained
+        .save_file(out.join("student"), &BinFileRecorder::<FullPrecisionSettings>::default())
+        .context("save student.bin")?;
+    Recorder::<B>::record(mpk, optim.to_record(), out.join("optim")).context("save optim.mpk")?;
+    // Written last: its presence is what marks the other three as a coherent set.
+    fs::write(out.join("state.json"), serde_json::to_vec_pretty(state)?).context("save state.json")?;
+    Ok(())
+}
+
 /// Train the student on a teacher cache for one *chunk*, returning this chunk's
 /// per-step losses and the cumulative run state.
 ///
@@ -231,6 +260,16 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     let began = Instant::now();
     let mut stopped_by = "chunk-steps";
     let mut history = Vec::with_capacity(chunk);
+    // Metrics go to a file as well as stdout. Kaggle truncates a kernel log to its
+    // tail, so a crash that panics in a loop evicts the entire loss history — the
+    // one artefact that would say whether the run was healthy before it died.
+    // This file lives in `out`, so it ships with the checkpoint.
+    let mut metrics = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out.join("metrics.jsonl"))
+        .context("open metrics.jsonl")?;
+    let mut last_saved = start_step;
     for i in 1..=chunk {
         let step = start_step + i;
         let sample = shards.get((step - 1) % num_shards)?;
@@ -265,11 +304,37 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         state.steps_done = step;
         state.last_loss = m.total;
         if m.total < state.best_loss { state.best_loss = m.total; }
+        let line = serde_json::json!({"step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "total": m.total});
         if i % s.log_every.max(1) == 0 || i == 1 {
-            println!("{}", serde_json::json!({"step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "total": m.total}));
+            println!("{line}");
         }
+
+        // A diverged run is worth catching on the step it happens, not hours later.
+        // serde_json writes a non-finite float as `null`, so NaN reaches state.json
+        // and the logs as an absence rather than a number — easy to read as "no
+        // data" when it means "the run is destroyed". Every metric is recorded
+        // before bailing, and nothing is saved: the last periodic checkpoint stays
+        // the newest *good* one rather than being overwritten with NaN weights.
+        if !m.total.is_finite() {
+            writeln!(metrics, "{line}").ok();
+            bail!(
+                "loss became non-finite at step {step} (output={}, temporal={}, feature={}).\n\
+                 Weights from this step are unusable and were NOT saved; the checkpoint in {} is \
+                 from step {last_saved}.\n\
+                 Most likely the learning rate is too high — this run used {:e}, and \
+                 python/longlive_distill/configs/browser-384m-umt5.yaml specifies 2e-5.",
+                m.output, m.temporal, m.feature, out.display(), s.lr
+            );
+        }
+        writeln!(metrics, "{line}").context("append to metrics.jsonl")?;
+
+        // A full checkpoint, not a bare weights snapshot: `student.mpk` alone is not
+        // resumable, and a numbered file per interval would add 1.5 GB each time.
         if s.ckpt_every > 0 && step % s.ckpt_every == 0 {
-            model.valid().save_file(out.join(format!("step-{step:06}")), &mpk)?;
+            write_checkpoint(out, &model, &optim, &state, &mpk)
+                .with_context(|| format!("periodic checkpoint at step {step}"))?;
+            last_saved = step;
+            eprintln!("checkpoint written at step {step}");
         }
         if s.max_seconds > 0 && began.elapsed().as_secs() >= s.max_seconds {
             stopped_by = "max-seconds";
@@ -283,11 +348,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     state.completed = s.target_steps > 0 && state.steps_done >= s.target_steps;
     state.stopped_by = if state.completed { "target".into() } else { stopped_by.into() };
 
-    let trained = model.valid();
-    trained.clone().save_file(out.join("student"), &mpk)?;
-    trained.save_file(out.join("student"), &BinFileRecorder::<FullPrecisionSettings>::default())?;
-    Recorder::<B>::record(&mpk, optim.to_record(), out.join("optim"))?;
-    fs::write(out.join("state.json"), serde_json::to_vec_pretty(&state)?)?;
+    write_checkpoint(out, &model, &optim, &state, &mpk)?;
     Ok((history, state))
 }
 
@@ -394,6 +455,39 @@ mod tests {
     }
 
     #[test]
+    // A diverged run must stop on the step it diverges, and must not overwrite the
+    // last good checkpoint with NaN weights. The first real Kaggle chunk trained
+    // for 7.5 hours, logged `null` for every metric (serde_json's rendering of
+    // NaN), and produced nothing resumable — this is the guard against a repeat.
+    #[test]
+    fn non_finite_loss_aborts_and_leaves_the_last_checkpoint_intact() {
+        let _seed = seed_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let out = dir.path().join("run");
+        let spec = tiny_spec();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
+
+        let device = NdArrayDevice::default();
+        // Absurd lr with clipping effectively disabled: this diverges in a step or
+        // two. ckpt_every=1 guarantees a good checkpoint exists before it does.
+        let settings = TrainSettings {
+            steps: 50, lr: 1e30, grad_clip: f32::MAX, log_every: 1, ckpt_every: 1, ..Default::default()
+        };
+        let err = train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &device)
+            .expect_err("lr=1e30 should diverge, not converge");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("non-finite"), "wrong failure mode: {msg}");
+        assert!(msg.contains("2e-5"), "error should name the reference lr: {msg}");
+
+        // The pre-divergence checkpoint survives, and no NaN reached state.json.
+        assert!(out.join("state.json").exists(), "diverging destroyed the checkpoint");
+        let state: TrainState = serde_json::from_slice(&fs::read(out.join("state.json")).unwrap())
+            .expect("state.json must still deserialize — NaN would have written null");
+        assert!(state.last_loss.is_finite(), "NaN was persisted as the run state");
+    }
+
+    #[test]
     fn synth_train_save_reload_forward() {
         let _seed = seed_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -411,7 +505,13 @@ mod tests {
         assert!(losses.last().unwrap() < losses.first().unwrap(), "loss did not decrease: {losses:?}");
         assert!(out.join("student.mpk").exists());
         assert!(out.join("student.bin").exists());
-        assert!(out.join("step-000010.mpk").exists());
+        assert!(out.join("optim.mpk").exists());
+        assert!(out.join("state.json").exists());
+        // Metrics are persisted, not merely printed: a truncated kernel log must
+        // not be the only record of how the run behaved. log_every=5 over 20 steps
+        // logs steps 1, 5, 10, 15, 20 — but *every* step is written to the file.
+        let metrics = fs::read_to_string(out.join("metrics.jsonl")).unwrap();
+        assert_eq!(metrics.lines().count(), 20, "metrics.jsonl should hold every step");
 
         // Reload the deployable .bin into a fresh (non-autodiff) model and run a forward pass —
         // the same record path `video-web` uses in the browser.
