@@ -93,6 +93,10 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
           TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}
+          # The distillation LR. 2e-5 matches the reference config; 1e-4 diverges
+          # (feature loss → NaN) even with grad-clip. Override via a repo variable
+          # only if you change the spec/loss weights and re-tune.
+          TRAIN_LR: ${{ vars.TRAIN_LR || '2e-5' }}
           CHUNK_STEPS: ${{ github.event.inputs.chunk_steps || vars.CHUNK_STEPS || '20000' }}
           TARGET_STEPS: ${{ github.event.inputs.target_steps || vars.TARGET_STEPS || '200000' }}
           ALLOW_SYNTHETIC_TEACHER: ${{ github.event.inputs.allow_synthetic_teacher || 'false' }}

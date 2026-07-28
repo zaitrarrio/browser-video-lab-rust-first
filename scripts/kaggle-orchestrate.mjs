@@ -68,7 +68,10 @@ const CONFIG = {
   features: env("TRAIN_FEATURES", "cuda"),
   chunk_steps: Number(env("CHUNK_STEPS", "20000")),
   target_steps: Number(env("TARGET_STEPS", "200000")),
-  lr: Number(env("TRAIN_LR", "1e-4")),
+  // 2e-5 is what browser-384m-umt5.yaml specifies for this student, and what the
+  // trainer's non-finite guard points you back to. 1e-4 diverges: the quadratic
+  // feature/Gram loss goes NaN a few hundred steps in, even under grad-clip 1.0.
+  lr: Number(env("TRAIN_LR", "2e-5")),
   log_every: Number(env("LOG_EVERY", "200")),
   // A full resumable checkpoint this often. The cost is one save per interval;
   // the alternative is what an end-of-chunk-only save cost on the first real run,

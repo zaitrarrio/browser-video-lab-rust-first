@@ -8,6 +8,12 @@ Five related experiments in one project:
 4. **Rust student (Burn · WGPU · WASM)** — the Burn latent-video student compiled to WebAssembly, running its denoiser directly on WebGPU with no ONNX Runtime. See [Rust-first edition](#rust-first-edition).
 5. **Wan 2.1 + Pruna Smash** — native CUDA compression, persistence and benchmarking for `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
 
+> **Research & white paper.** For the distillation architecture behind experiment 4 —
+> the framework-neutral teacher cache, the width-independent relation loss, cross-encoder
+> conditioning, the free-tier Kaggle pipeline, the role of Pruna Smash, and how the
+> approach transfers to image and text models — see **[`docs/WHITEPAPER.md`](docs/WHITEPAPER.md)**
+> (external-facing) and **[`docs/RESEARCH.md`](docs/RESEARCH.md)** (file-grounded research notes).
+
 The three ONNX browser runtimes do not download multi-gigabyte weights with the repository. Put exported ONNX models under `public/models`, then copy each `manifest.example.json` to `manifest.json` (the interactive UI defaults to the shipped `manifest.example.json` so it loads out of the box). Large ONNX files should be hosted with byte-range support in production. The Rust student needs no ONNX export — build it with `task rust:wasm` (outputs to `public/rust-video/`).
 
 ## Browser app
