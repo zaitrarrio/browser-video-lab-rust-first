@@ -1,0 +1,91 @@
+name: Train Student (CPU repro)
+
+# One-off diagnostic, not a training pipeline: reruns the exact same spec, lr,
+# and seed as train.yml against the real teacher cache, but on Kaggle's CPU
+# tier (ndarray backend, no CUDA) instead of GPU.
+#
+# Why this exists: the GPU run hits a non-finite feature/Gram loss reproducibly
+# around step 349, always flagging hidden layer 0, while `output`/`temporal`
+# (which depend on the same forward pass, just further downstream) stay
+# perfectly healthy the whole time. That combination — one side-channel
+# breaking, the main output path fine — is not what a genuine model-wide
+# numerical divergence looks like, and this codebase's async CUDA stream is
+# independently known to panic on a stale memory handle during teardown
+# (cubecl-cuda 0.10.0, see the fix in 1adb1f1). This run answers one question:
+# does the same non-finite step happen on CPU (NdArray, fully synchronous, no
+# async GPU stream) against the identical data and seed? If yes, it's a real
+# model/math instability. If no, the GPU backend is the more likely suspect.
+#
+# Deliberately namespaced separately from train.yml (browser-video-student-chunk
+# vs browser-video-student-chunk-cpu) so this gets its own toolchain and
+# checkpoint datasets rather than colliding with the CUDA-built ones — but it
+# still mounts the one real teacher-cache dataset via TEACHER_DATASET.
+#
+# Same one-time setup as train.yml (see kaggle/README.md): repo secrets
+# KAGGLE_API_TOKEN (a KGAT_ token) and KAGGLE_USERNAME.
+on:
+  workflow_dispatch:
+    inputs:
+      target_steps:
+        description: "Steps to run (400 comfortably passes step 349-353)"
+        type: string
+        default: "400"
+
+concurrency:
+  group: train-student-cpu-repro
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KAGGLE_CLI_VERSION: "2.2.4"
+
+jobs:
+  chunk:
+    name: Train one CPU-backend chunk on Kaggle
+    runs-on: ubuntu-latest
+    # CPU forward/backward on a 383M-param, 1536-token-attention model with no
+    # GPU is slow and not wall-clock bounded here on purpose — only bounds how
+    # long we sit polling it, same reasoning as cache.yml.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: pipx install "kaggle==$KAGGLE_CLI_VERSION"
+
+      - name: Launch CPU-backend repro chunk
+        id: train
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KERNEL_SLUG: browser-video-student-chunk-cpu
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}
+          # The real teacher cache lives under the GPU pipeline's slug; this
+          # kernel runs under a different slug so it doesn't share a toolchain
+          # or checkpoint dataset with the CUDA build, but the data is the same.
+          TEACHER_DATASET: "${{ secrets.KAGGLE_USERNAME }}/browser-video-student-chunk-teacher-cache"
+          TRAIN_BACKEND: ndarray
+          # Empty, deliberately: the ndarray backend needs no extra cargo
+          # feature, and this CPU-only kernel has no CUDA toolchain to build one.
+          TRAIN_FEATURES: ""
+          ENABLE_GPU: "false"
+          # Same lr as the GPU run (browser-384m-umt5.yaml's reference value) —
+          # this is a same-inputs comparison, not a retune.
+          TRAIN_LR: "2e-5"
+          CHUNK_STEPS: ${{ github.event.inputs.target_steps || '400' }}
+          TARGET_STEPS: ${{ github.event.inputs.target_steps || '400' }}
+          LOG_EVERY: "1"
+          CKPT_EVERY: "0"
+          ALLOW_SYNTHETIC_TEACHER: "false"
+        run: node scripts/kaggle-orchestrate.mjs

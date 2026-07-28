@@ -65,7 +65,10 @@ const CONFIG = {
   commit: env("GITHUB_SHA", execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT }).toString().trim()),
   spec: env("TRAIN_SPEC", "rust/config/browser-390m-umt5.json"),
   backend: env("TRAIN_BACKEND", "cuda"),
-  features: env("TRAIN_FEATURES", "cuda"),
+  // Empty is a legitimate, distinct choice here (an ndarray/CPU build needs no
+  // extra cargo feature), so this bypasses the strict env() helper — which
+  // treats an empty override as a mistake — rather than reusing it.
+  features: process.env.TRAIN_FEATURES !== undefined ? process.env.TRAIN_FEATURES : "cuda",
   chunk_steps: Number(env("CHUNK_STEPS", "20000")),
   target_steps: Number(env("TARGET_STEPS", "200000")),
   // 2e-5 is what browser-384m-umt5.yaml specifies for this student, and what the
@@ -82,6 +85,10 @@ const CONFIG = {
   session_seconds: Number(env("SESSION_SECONDS", String(11 * 3600))),
   upload_reserve_seconds: Number(env("UPLOAD_RESERVE_SECONDS", "900")),
   allow_synthetic_teacher: env("ALLOW_SYNTHETIC_TEACHER", "false") === "true",
+  // A CPU-backend repro kernel wants no GPU at all — requesting one it doesn't
+  // need risks failing on a CPU-only host image or burning GPU quota for
+  // nothing. Defaults true so every existing caller is unaffected.
+  enable_gpu: env("ENABLE_GPU", "true") === "true",
   api_token: API_TOKEN,
   // The kernel installs this exact CLI before authenticating, so only one
   // credential shape is valid there — see authenticate() in run_chunk.py. CI
@@ -90,7 +97,12 @@ const CONFIG = {
   kaggle_cli_version: env("KAGGLE_CLI_VERSION", "2.2.4"),
   toolchain_dataset: `${OWNER}/${SLUG}-toolchain`,
   toolchain_title: titleFor(`${SLUG}-toolchain`),
-  teacher_dataset: `${OWNER}/${SLUG}-teacher-cache`,
+  // Overridable so a kernel running under a different SLUG (e.g. a CPU-backend
+  // repro, kept separate so it gets its own toolchain/checkpoint datasets
+  // rather than colliding with a CUDA-built one) can still mount the one real
+  // teacher cache instead of looking for `<slug>-teacher-cache` and finding
+  // nothing.
+  teacher_dataset: env("TEACHER_DATASET", `${OWNER}/${SLUG}-teacher-cache`),
   checkpoint_dataset: `${OWNER}/${SLUG}-checkpoint`,
   checkpoint_title: titleFor(`${SLUG}-checkpoint`),
 };
@@ -154,7 +166,7 @@ function renderKernel(config) {
     language: "python",
     kernel_type: "script",
     is_private: true,
-    enable_gpu: true,
+    enable_gpu: config.enable_gpu,
     enable_internet: true,
     // Mounting a dataset that has no versions yet fails the push, so only ask
     // for caches that actually exist. A cold pipeline simply starts from zero.
