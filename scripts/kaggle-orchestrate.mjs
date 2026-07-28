@@ -159,6 +159,14 @@ function renderKernel(config) {
   // JSON inside a Python r"""...""" literal: the only sequence that could close
   // it early is a quote run, which JSON.stringify escapes as \" — safe.
   writeFileSync(join(dir, "run_chunk.py"), template.replace("{{CONFIG}}", JSON.stringify(config, null, 2)));
+  const candidates = [config.toolchain_dataset, config.teacher_dataset, config.checkpoint_dataset];
+  const mounted = candidates.filter(datasetExists);
+  // Which of these actually got mounted is exactly the thing that was
+  // ambiguous after the first two dispatches — this makes it explicit instead
+  // of something to infer from whether a retry happened to log.
+  for (const slug of candidates) {
+    console.log(`dataset_sources: ${slug} -> ${mounted.includes(slug) ? "mounted" : "NOT mounted"}`);
+  }
   writeFileSync(join(dir, "kernel-metadata.json"), JSON.stringify({
     id: `${OWNER}/${SLUG}`,
     title: titleFor(SLUG),
@@ -170,8 +178,7 @@ function renderKernel(config) {
     enable_internet: true,
     // Mounting a dataset that has no versions yet fails the push, so only ask
     // for caches that actually exist. A cold pipeline simply starts from zero.
-    dataset_sources: [config.toolchain_dataset, config.teacher_dataset, config.checkpoint_dataset]
-      .filter(datasetExists),
+    dataset_sources: mounted,
     competition_sources: [],
     kernel_sources: [],
   }, null, 2) + "\n");
