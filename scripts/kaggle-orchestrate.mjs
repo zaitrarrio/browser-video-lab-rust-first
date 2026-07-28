@@ -179,8 +179,24 @@ function renderKernel(config) {
 }
 
 function datasetExists(slug) {
-  const { code, out } = kaggle(["datasets", "status", slug], { check: false });
-  return code === 0 && !/not found|404/i.test(out);
+  // Kaggle's own status endpoint has been observed to 403 transiently on this
+  // exact pipeline (this session hit it repeatedly, on calls that succeeded a
+  // few seconds later with no change on our end). A single-shot check here
+  // means a passing blip silently drops a real, existing dataset from
+  // dataset_sources — the kernel then finds nothing mounted and, correctly
+  // given what it can see, refuses to train on an empty cache. That reads as
+  // "the dataset is missing" when it actually means "the check was flaky",
+  // which is a materially different problem to debug.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { code, out } = kaggle(["datasets", "status", slug], { check: false });
+    if (code === 0 && !/not found|404/i.test(out)) return true;
+    if (/not found|404/i.test(out)) return false; // a real miss, not worth retrying
+    if (attempt < 3) {
+      console.log(`datasetExists(${slug}) attempt ${attempt} inconclusive (${out.trim().slice(0, 120)}); retrying`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+    }
+  }
+  return false;
 }
 
 const TERMINAL = { complete: "complete", error: "error", cancelAcknowledged: "cancelAcknowledged" };
