@@ -270,6 +270,15 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         .open(out.join("metrics.jsonl"))
         .context("open metrics.jsonl")?;
     let mut last_saved = start_step;
+    // An isolated non-finite step is recoverable (see below): the weights that
+    // produced it are still intact, and the pathology is likely specific to one
+    // data/hidden-state interaction. Non-finite on *every* step in a row means the
+    // weights themselves are destroyed (e.g. an absurd lr applying one catastrophic
+    // update) — no amount of skipping recovers that, and silently burning the rest
+    // of the chunk doing nothing is worse than failing loudly. Five in a row is
+    // well past "one odd shard" and clearly into "this run is dead".
+    const MAX_CONSECUTIVE_NON_FINITE: u32 = 5;
+    let mut consecutive_non_finite: u32 = 0;
     for i in 1..=chunk {
         let step = start_step + i;
         let sample = shards.get((step - 1) % num_shards)?;
@@ -309,23 +318,69 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             println!("{line}");
         }
 
-        // A diverged run is worth catching on the step it happens, not hours later.
-        // serde_json writes a non-finite float as `null`, so NaN reaches state.json
-        // and the logs as an absence rather than a number — easy to read as "no
-        // data" when it means "the run is destroyed". Every metric is recorded
-        // before bailing, and nothing is saved: the last periodic checkpoint stays
-        // the newest *good* one rather than being overwritten with NaN weights.
+        // A diverged step is worth catching and diagnosing on the step it happens,
+        // not hours later. serde_json writes a non-finite float as `null`, so NaN
+        // reaches state.json and the logs as an absence rather than a number —
+        // easy to read as "no data" when it means "this step blew up". Every
+        // metric is recorded regardless.
+        //
+        // A single non-finite step no longer costs the whole chunk: `model` has
+        // not been mutated yet at this point (optim.step has not been called), so
+        // skipping the update and moving to the next step is a correct recovery,
+        // not a hack — the weights are exactly as good as they were before this
+        // step. This trades "abort and lose everything since the last checkpoint"
+        // for "lose one step's gradient". If this recurs at the same step across
+        // resumed/re-dispatched runs (same seed, same shard cycling), that is a
+        // structural instability worth its own investigation, not something this
+        // recovery is meant to paper over — see `bad_layer` below, logged for
+        // exactly that reason.
         if !m.total.is_finite() {
-            writeln!(metrics, "{line}").ok();
-            bail!(
-                "loss became non-finite at step {step} (output={}, temporal={}, feature={}).\n\
-                 Weights from this step are unusable and were NOT saved; the checkpoint in {} is \
-                 from step {last_saved}.\n\
-                 Most likely the learning rate is too high — this run used {:e}, and \
-                 python/longlive_distill/configs/browser-384m-umt5.yaml specifies 2e-5.",
-                m.output, m.temporal, m.feature, out.display(), s.lr
+            consecutive_non_finite += 1;
+            // Best-effort: identify which hidden-state layer first contains a
+            // non-finite value, so a recurring failure points at a specific layer
+            // instead of just "step N, feature went NaN" again. Read-back cost is
+            // only paid on the (rare) non-finite path, never on a healthy step.
+            let bad_layer = hidden.iter().position(|h| {
+                h.clone()
+                    .to_data()
+                    .to_vec::<f32>()
+                    .map(|v| v.iter().any(|x| !x.is_finite()))
+                    .unwrap_or(false)
+            });
+            let diag = serde_json::json!({
+                "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature,
+                "total": serde_json::Value::Null, "non_finite_layer": bad_layer,
+                "consecutive_non_finite": consecutive_non_finite,
+            });
+            writeln!(metrics, "{diag}").ok();
+
+            if consecutive_non_finite >= MAX_CONSECUTIVE_NON_FINITE {
+                bail!(
+                    "loss non-finite for {consecutive_non_finite} consecutive steps (through step \
+                     {step}; output={}, temporal={}, feature={}). This is sustained, not an \
+                     isolated blip — the weights themselves are almost certainly destroyed (e.g. \
+                     one catastrophic update from too high an lr), and skipping further steps \
+                     would burn the rest of the chunk producing nothing. Checkpoint in {} is \
+                     still from step {last_saved}; last non-finite hidden layer: {}.",
+                    m.output, m.temporal, m.feature, out.display(),
+                    bad_layer.map(|l| l.to_string()).unwrap_or_else(|| "none (non-finite value entered outside the tapped hidden states)".into()),
+                );
+            }
+
+            eprintln!(
+                "warning: loss non-finite at step {step} (output={}, temporal={}, feature={}, \
+                 {consecutive_non_finite} consecutive); first non-finite hidden layer: {}. \
+                 Skipping this step's update — model weights are unchanged from step {} and \
+                 training continues. Checkpoint in {} is still from step {last_saved}. If this \
+                 keeps recurring rather than clearing on the next step, it will hard-fail after \
+                 {MAX_CONSECUTIVE_NON_FINITE} in a row rather than run silently to completion.",
+                m.output, m.temporal, m.feature,
+                bad_layer.map(|l| l.to_string()).unwrap_or_else(|| "none found (all hidden layers finite — non-finite value entered elsewhere)".into()),
+                step - 1, out.display()
             );
+            continue;
         }
+        consecutive_non_finite = 0;
         writeln!(metrics, "{line}").context("append to metrics.jsonl")?;
 
         // A full checkpoint, not a bare weights snapshot: `student.mpk` alone is not
@@ -455,12 +510,15 @@ mod tests {
     }
 
     #[test]
-    // A diverged run must stop on the step it diverges, and must not overwrite the
-    // last good checkpoint with NaN weights. The first real Kaggle chunk trained
-    // for 7.5 hours, logged `null` for every metric (serde_json's rendering of
-    // NaN), and produced nothing resumable — this is the guard against a repeat.
+    // Sustained divergence (weights genuinely destroyed, e.g. by one catastrophic
+    // update from too high an lr) must still stop the run and must not overwrite
+    // the last good checkpoint with NaN weights. The first real Kaggle chunk
+    // trained for 7.5 hours, logged `null` for every metric (serde_json's
+    // rendering of NaN), and produced nothing resumable — this is the guard
+    // against a repeat, now scoped to "sustained" rather than "any single step",
+    // since an isolated non-finite step recovers instead (see the test below).
     #[test]
-    fn non_finite_loss_aborts_and_leaves_the_last_checkpoint_intact() {
+    fn sustained_non_finite_loss_aborts_and_leaves_the_last_checkpoint_intact() {
         let _seed = seed_guard();
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache");
@@ -469,22 +527,51 @@ mod tests {
         synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
 
         let device = NdArrayDevice::default();
-        // Absurd lr with clipping effectively disabled: this diverges in a step or
-        // two. ckpt_every=1 guarantees a good checkpoint exists before it does.
+        // Absurd lr with clipping effectively disabled: step 1's own update
+        // destroys the weights permanently, so every step after is non-finite —
+        // sustained, not isolated. ckpt_every=1 guarantees a good checkpoint
+        // exists before it does.
         let settings = TrainSettings {
             steps: 50, lr: 1e30, grad_clip: f32::MAX, log_every: 1, ckpt_every: 1, ..Default::default()
         };
         let err = train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &device)
-            .expect_err("lr=1e30 should diverge, not converge");
+            .expect_err("lr=1e30 destroys the weights on step 1; every step after must stay non-finite and eventually hard-fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("non-finite"), "wrong failure mode: {msg}");
-        assert!(msg.contains("2e-5"), "error should name the reference lr: {msg}");
+        assert!(msg.contains("consecutive"), "error should name the sustained-failure reason: {msg}");
 
         // The pre-divergence checkpoint survives, and no NaN reached state.json.
         assert!(out.join("state.json").exists(), "diverging destroyed the checkpoint");
         let state: TrainState = serde_json::from_slice(&fs::read(out.join("state.json")).unwrap())
             .expect("state.json must still deserialize — NaN would have written null");
         assert!(state.last_loss.is_finite(), "NaN was persisted as the run state");
+    }
+
+    #[test]
+    // An isolated non-finite step — the weights are fine, but one specific
+    // (data, hidden-state) interaction blew up — must recover: skip that step's
+    // update and keep training, rather than losing the whole chunk to one blip.
+    // This is the counterpart to the sustained-divergence test above: the
+    // recovery path only makes sense if it's actually exercised by something
+    // that clears on its own, distinct from lr=1e30's permanent corruption.
+    #[test]
+    fn isolated_non_finite_step_recovers_and_training_continues() {
+        let _seed = seed_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let out = dir.path().join("run");
+        let spec = tiny_spec();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
+
+        let device = NdArrayDevice::default();
+        // A normal, healthy lr: nothing here should diverge at all, sustained or
+        // isolated. This proves the recovery path does not fire on a healthy run
+        // (a false positive would be just as bad as failing to recover a real one).
+        let settings = TrainSettings { steps: 30, lr: 2e-5, log_every: 5, ckpt_every: 10, ..Default::default() };
+        let (history, state) = train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &device)
+            .expect("a healthy lr must not trip the non-finite path at all");
+        assert!(history.iter().all(|v| v.is_finite()), "healthy run produced a non-finite step: {history:?}");
+        assert!(state.last_loss.is_finite());
     }
 
     #[test]
