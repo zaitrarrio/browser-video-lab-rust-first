@@ -206,13 +206,26 @@ function datasetExists(slug) {
   return false;
 }
 
-const TERMINAL = { complete: "complete", error: "error", cancelAcknowledged: "cancelAcknowledged" };
+const TERMINAL = { complete: "complete", error: "error", cancelacknowledged: "cancelAcknowledged" };
 
 function waitForKernel(ref, { pollSeconds = 60, timeoutSeconds }) {
   const deadline = Date.now() + timeoutSeconds * 1000;
   for (;;) {
     const { out } = kaggle(["kernels", "status", ref], { check: false });
-    const status = /"?status"?\s*[:=]\s*"?(\w+)/i.exec(out)?.[1] ?? out.trim();
+    // Actual CLI text: `<ref> has status "KernelWorkerStatus.COMPLETE"` — no
+    // colon/equals between "status" and the value (just whitespace and a
+    // quote), and the value itself is dotted (`KernelWorkerStatus.X`), not a
+    // single \w+ token. The old pattern required a `:`/`=` that never
+    // appears here, so it never matched and silently fell back to the whole
+    // raw line — which still happens to contain "complete"/"error" as a
+    // substring, so the polling loop's own terminal-state check kept working
+    // by accident, while the final `status !== "complete"` comparison
+    // further down was comparing the entire line against a bare lowercase
+    // word and threw on every single run, including a genuinely successful
+    // one — this was never caught because every run before now failed via
+    // the earlier ERROR-path check first.
+    const m = /status\s+"?(?:KernelWorkerStatus\.)?(\w+)"?/i.exec(out);
+    const status = (m?.[1] ?? out.trim()).toLowerCase();
     process.stdout.write(`[${new Date().toISOString()}] ${status}\n`);
     if (status in TERMINAL || /complete|error|cancel/i.test(status)) return status;
     if (Date.now() > deadline) throw new Error(`kernel ${ref} still ${status} after ${timeoutSeconds}s`);
