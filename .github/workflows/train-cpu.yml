@@ -30,6 +30,10 @@ on:
         description: "Steps to run (400 comfortably passes step 349-353)"
         type: string
         default: "400"
+      teacher_dataset_suffix:
+        description: "Dataset name (under the Kaggle account) to mount as the teacher cache"
+        type: string
+        default: "browser-video-student-chunk-teacher-cache"
 
 concurrency:
   group: train-student-cpu-repro
@@ -74,7 +78,7 @@ jobs:
           # The real teacher cache lives under the GPU pipeline's slug; this
           # kernel runs under a different slug so it doesn't share a toolchain
           # or checkpoint dataset with the CUDA build, but the data is the same.
-          TEACHER_DATASET: "${{ secrets.KAGGLE_USERNAME }}/browser-video-student-chunk-teacher-cache"
+          TEACHER_DATASET: "${{ secrets.KAGGLE_USERNAME }}/${{ github.event.inputs.teacher_dataset_suffix || 'browser-video-student-chunk-teacher-cache' }}"
           TRAIN_BACKEND: ndarray
           # Empty, deliberately: the ndarray backend needs no extra cargo
           # feature, and this CPU-only kernel has no CUDA toolchain to build one.
