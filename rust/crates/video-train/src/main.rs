@@ -3,6 +3,7 @@ use burn::backend::{ndarray::NdArrayDevice, wgpu::WgpuDevice, Autodiff, NdArray,
 use clap::{Parser, Subcommand};
 use std::{fs, path::PathBuf};
 use video_contract::StudentSpec;
+use video_train::sample::{evaluate, sample, SampleArgs};
 use video_train::{synth_cache, train, TrainSettings};
 
 #[derive(Parser)]
@@ -52,6 +53,38 @@ enum Command {
         #[arg(long, default_value_t = 0)] target_steps: usize,
         /// Max decoded shards held resident by the lazy loader (bounds RAM).
         #[arg(long, default_value_t = 128)] shard_cache: usize,
+        /// Shards summed per optimizer step — the effective batch size. 1 keeps
+        /// the historical one-shard-per-step behaviour exactly.
+        #[arg(long, default_value_t = 1)] accum: usize,
+    },
+    /// Integrate the trained student's velocity field from noise to a clean latent
+    /// and write it as safetensors for a VAE decode. This is the step that turns
+    /// "the loss went down" into something you can actually look at.
+    Sample {
+        #[arg(long)] spec: PathBuf,
+        #[arg(long)] weights: PathBuf,
+        /// Safetensors carrying `student_prompt_embeds` (a cache shard works).
+        #[arg(long)] prompt: Option<PathBuf>,
+        #[arg(long)] output: PathBuf,
+        #[arg(long, default_value = "wgpu")] backend: String,
+        #[arg(long, default_value_t = 32)] steps: usize,
+        /// Wan's flow_shift (3.0 for the 1.3B checkpoint); 1.0 disables the warp.
+        #[arg(long, default_value_t = 3.0)] shift: f32,
+        #[arg(long, default_value_t = 4)] frames: usize,
+        #[arg(long, default_value_t = 32)] height: usize,
+        #[arg(long, default_value_t = 32)] width: usize,
+        #[arg(long, default_value_t = 1)] seed: u32,
+    },
+    /// Teacher parity on a cache: mean cosine and relative L2 between the
+    /// student's prediction and the teacher's on identical inputs. Point it at
+    /// held-out shards for a generalization number.
+    Eval {
+        #[arg(long)] spec: PathBuf,
+        #[arg(long)] weights: PathBuf,
+        #[arg(long)] cache: PathBuf,
+        #[arg(long, default_value = "wgpu")] backend: String,
+        /// Shards to score (0 = all).
+        #[arg(long, default_value_t = 0)] limit: usize,
     },
 }
 
@@ -62,9 +95,9 @@ fn main() -> Result<()> {
             synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip)?;
             println!("wrote {} synthetic shards to {}", shards * draws_per_clip, output.display());
         }
-        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache } => {
+        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache };
+            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum };
             let (losses, state) = match backend.as_str() {
                 "ndarray" => train::<Autodiff<NdArray>>(spec, &cache, &output, &settings, &NdArrayDevice::default())?,
                 "wgpu" => train::<Autodiff<Wgpu>>(spec, &cache, &output, &settings, &WgpuDevice::default())?,
@@ -84,6 +117,31 @@ fn main() -> Result<()> {
                 if state.completed { "COMPLETED" } else { "resume for more" },
                 output.display(),
             );
+        }
+        Command::Sample { spec, weights, prompt, output, backend, steps, shift, frames, height, width, seed } => {
+            let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
+            let args = SampleArgs { spec, weights, prompt, output, steps, shift, frames, height, width, seed };
+            match backend.as_str() {
+                "ndarray" => sample::<NdArray>(&args, &NdArrayDevice::default())?,
+                "wgpu" => sample::<Wgpu>(&args, &WgpuDevice::default())?,
+                #[cfg(feature = "cuda")]
+                "cuda" => sample::<burn::backend::Cuda>(&args, &Default::default())?,
+                #[cfg(not(feature = "cuda"))]
+                "cuda" => bail!("rebuild with --features cuda for the CUDA backend"),
+                other => bail!("unknown backend {other}; use ndarray | wgpu | cuda"),
+            }
+        }
+        Command::Eval { spec, weights, cache, backend, limit } => {
+            let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
+            match backend.as_str() {
+                "ndarray" => evaluate::<NdArray>(&spec, &weights, &cache, limit, &NdArrayDevice::default())?,
+                "wgpu" => evaluate::<Wgpu>(&spec, &weights, &cache, limit, &WgpuDevice::default())?,
+                #[cfg(feature = "cuda")]
+                "cuda" => evaluate::<burn::backend::Cuda>(&spec, &weights, &cache, limit, &Default::default())?,
+                #[cfg(not(feature = "cuda"))]
+                "cuda" => bail!("rebuild with --features cuda for the CUDA backend"),
+                other => bail!("unknown backend {other}; use ndarray | wgpu | cuda"),
+            };
         }
     }
     Ok(())

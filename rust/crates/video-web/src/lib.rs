@@ -8,6 +8,11 @@ use video_student::quant::{dequantize_module, QTensor};
 use video_student::BrowserVideoStudent;
 use wasm_bindgen::prelude::*;
 
+/// Wan's `flow_shift` for the 1.3B checkpoint. Must match the `--shift` the
+/// teacher cache was built with and the `--shift` `video-train sample` uses; a
+/// student trained under one warp and sampled under another wastes its steps.
+const FLOW_SHIFT: f32 = 3.0;
+
 /// Deterministic Gaussian source mirroring the JS `normal()` LCG so browser
 /// runs are reproducible for a given seed.
 struct Lcg {
@@ -110,6 +115,17 @@ impl BrowserModel {
     /// Run `steps` denoising iterations on a single `side`×`side` latent frame
     /// seeded by `seed`, then decode the first three latent channels to RGBA.
     /// Returns a `side*side*4` byte buffer (surfaced to JS as a `Uint8Array`).
+    ///
+    /// Two standing caveats, both structural rather than cosmetic:
+    ///
+    /// * **One frame, not video.** The latent is `[1,C,1,side,side]`. The student
+    ///   is a video model and its temporal-difference term is trained on `T>1`;
+    ///   this path exercises none of that.
+    /// * **Not a decode.** The RGBA below false-colours the first three of
+    ///   sixteen latent channels. No arrangement of latent channels is an image —
+    ///   turning a latent into pixels needs the VAE (`decode_latents.py` does it
+    ///   server-side). Until a decoder ships to the browser, this output is a
+    ///   diagnostic view, and must not be read as "the model produced a frame".
     pub async fn generate(&self, seed: u32, steps: u32, side: usize, prompt_embeds: &[f32]) -> Result<Vec<u8>, JsError> {
         let model = self
             .model
@@ -154,13 +170,23 @@ impl BrowserModel {
         let prompt = Tensor::<Wgpu, 1>::from_floats(prompt_vec.as_slice(), &device)
             .reshape([1, seq, text_width]);
 
+        // Flow-matching Euler down the SAME shifted sigma schedule the cache was
+        // built with (`cache_teacher.py --shift`, `video-train sample`). The
+        // student predicts a velocity, so the update is `x -= Δσ·v`; the warp only
+        // changes the spacing, not the endpoints. Sampling a shift-3 student on an
+        // unshifted schedule is not a visible error — it silently spends its steps
+        // in the wrong part of the trajectory, which is why the constant lives
+        // beside the trainer's default rather than being implied by `1/steps`.
         let steps = steps.max(1);
-        let rate = 1.0 / steps as f32;
+        let sigma = |i: u32| {
+            let s = 1.0 - i as f32 / steps as f32;
+            FLOW_SHIFT * s / (1.0 + (FLOW_SHIFT - 1.0) * s)
+        };
         for i in 0..steps {
-            let t = 999.0 * (1.0 - i as f32 / steps as f32);
-            let timestep = Tensor::<Wgpu, 1>::from_floats([t].as_slice(), &device).reshape([1, 1]);
+            let (s, s_next) = (sigma(i), sigma(i + 1));
+            let timestep = Tensor::<Wgpu, 1>::from_floats([s * 1000.0].as_slice(), &device).reshape([1, 1]);
             let (pred, _hidden) = model.forward(latents.clone(), timestep, prompt.clone());
-            latents = latents - pred.mul_scalar(rate);
+            latents = latents - pred.mul_scalar(s - s_next);
         }
 
         let frame = latents.reshape([channels, tokens]);

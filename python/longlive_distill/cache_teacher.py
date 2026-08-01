@@ -35,8 +35,17 @@ def resolve(spec):
 
 def select_layers(n: int, cap: int) -> list[int]:
     """`cap` linspaced layer indices (matching torch.linspace(...).round()), or
-    every layer when cap<=0 or exceeds what the teacher exposes."""
-    if cap <= 0 or cap >= n:
+    every layer when cap==0 or exceeds what the teacher exposes.
+
+    `cap < 0` caches no grams at all. That is not a degenerate case: a gram is
+    `tokens²` fp16 and at any real geometry it dominates the shard (10.6 MB per
+    layer at 2304 tokens against ~3 MB for everything else combined), so trading
+    the relation term away buys roughly an order of magnitude more distinct
+    (noise, sigma) draws for the same disk — and draw count, not step count, is
+    what actually bounds supervision here (TEACHER-OPTIONS.md)."""
+    if cap < 0:
+        return []
+    if cap == 0 or cap >= n:
         return list(range(n))
     return torch.linspace(0, n - 1, cap).round().long().tolist()
 
@@ -51,9 +60,19 @@ def main():
     p.add_argument('--teacher-name', default='Wan2.1-T2V-1.3B')
     p.add_argument('--device', default='cpu')
     p.add_argument('--draws-per-clip', type=int, default=1)
-    p.add_argument('--relation-layers', type=int, default=0, help='cap on cached relation layers; 0 = every layer')
+    p.add_argument('--relation-layers', type=int, default=0,
+                   help='cap on cached relation layers; 0 = every layer, negative = none (see select_layers)')
     p.add_argument('--adapter-arg', action='append', default=[], help='key=value forwarded to the adapter (value JSON-parsed)')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--noising', choices=['flow', 'legacy'], default='flow',
+                   help="flow: x_t=(1-s)x0+s*eps, Wan's actual flow-matching parameterization. "
+                        "legacy: the original x_t=x0+s*eps, kept only to reproduce old caches.")
+    p.add_argument('--shift', type=float, default=3.0,
+                   help="Wan flow_shift; warps the sigma draw towards high noise the way inference does")
+    p.add_argument('--guidance', type=float, default=0.0,
+                   help='>0 caches the CFG-combined velocity uncond + w*(cond-uncond) instead of the bare '
+                        'conditional one. Costs a second teacher pass per shard and is what lets the student '
+                        'be sampled without running CFG itself.')
     a = p.parse_args()
 
     cfg: dict = {}
@@ -80,19 +99,43 @@ def main():
             item = torch.load(file, map_location='cpu', weights_only=True)
             lat = item['latents'].float()
             prompt = item['prompt_embeds'].float()
+            negative = item.get('negative_prompt_embeds')
             student_prompt = item.get('student_prompt_embeds')
+            if a.guidance > 0 and negative is None:
+                raise SystemExit(
+                    f'--guidance {a.guidance} needs negative_prompt_embeds in {file.name}; '
+                    'build the dataset with make_wan_dataset.py, which stores them'
+                )
             for draw in range(max(1, a.draws_per_clip)):
                 g = torch.Generator().manual_seed(a.seed + i * 9973 + draw)
                 noise = torch.randn(lat.shape, generator=g)
-                t = torch.randint(0, 1000, (lat.shape[0],), generator=g)
-                sigma = (t.float() / 1000).view(-1, *([1] * (lat.dim() - 1)))
-                noisy = lat + noise * sigma
+                if a.noising == 'flow':
+                    # Wan is flow-matching: x_s = (1-s)x0 + s*eps, and the model
+                    # predicts the velocity eps-x0. Draw sigma directly (warped by
+                    # `shift` the way the inference schedule is) rather than an
+                    # integer timestep, so the cache covers exactly the sigmas a
+                    # sampler will visit. The old `x0 + s*eps` never reached pure
+                    # noise at s=1 and never reached clean data at s=0, so both
+                    # ends of the trajectory were supervised at the wrong point.
+                    u = torch.rand((lat.shape[0],), generator=g)
+                    s = a.shift * u / (1 + (a.shift - 1) * u) if a.shift > 0 else u
+                    t = (s * 1000).round().clamp(0, 999).to(torch.int64)
+                    sigma = s.view(-1, *([1] * (lat.dim() - 1)))
+                    noisy = (1 - sigma) * lat + sigma * noise
+                else:
+                    t = torch.randint(0, 1000, (lat.shape[0],), generator=g)
+                    sigma = (t.float() / 1000).view(-1, *([1] * (lat.dim() - 1)))
+                    noisy = lat + noise * sigma
                 result = teacher(noisy.to(a.device), t.to(a.device), prompt.to(a.device))
+                target = result['noise_pred'].float()
+                if a.guidance > 0:
+                    uncond = teacher(noisy.to(a.device), t.to(a.device), negative.float().to(a.device))
+                    target = uncond['noise_pred'].float() + a.guidance * (target - uncond['noise_pred'].float())
                 tensors = {
                     'noisy_latents': noisy.cpu().contiguous(),
-                    'timestep': t.to(torch.int64).cpu().contiguous(),
-                    'prompt_embeds': prompt.cpu().contiguous(),
-                    'teacher_noise_pred': result['noise_pred'].float().cpu().contiguous(),
+                    'timestep': t.cpu().contiguous(),
+                    'prompt_embeds': prompt.half().cpu().contiguous(),
+                    'teacher_noise_pred': target.cpu().contiguous(),
                 }
                 if student_prompt is not None:
                     tensors['student_prompt_embeds'] = student_prompt.float().cpu().contiguous()
@@ -110,10 +153,17 @@ def main():
                     for key, value in tensors.items():
                         shapes[key] = {'name': key, 'shape': list(value.shape), 'dtype': str(value.dtype).replace('torch.', '').upper()}
 
+    # The scheduler string is the cache's own record of the convention its targets
+    # were built under. A student trained on `flow` targets and sampled as if they
+    # were `legacy` ones produces garbage silently, so the two must travel together.
+    scheduler = a.scheduler if a.noising == 'legacy' else f'{a.scheduler}-flow-shift{a.shift:g}'
+    if a.guidance > 0:
+        scheduler += f'-cfg{a.guidance:g}'
+
     manifest = {
         'format_version': 1,
         'teacher': a.teacher_name,
-        'scheduler': a.scheduler,
+        'scheduler': scheduler,
         'shards': shards,
         'tensors': list(shapes.values()),
         'hidden_relation_layers': list(range(num_layers)),

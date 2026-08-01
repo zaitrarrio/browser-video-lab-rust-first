@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::module::{AutodiffModule, Module};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{backend::Backend, ElementConversion, Tensor};
@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::{Path, PathBuf}, time::Instant};
 use video_contract::{validate_cache, StudentSpec, TeacherCacheManifest, TensorShape};
 use video_student::{relation, temporal_difference, BrowserVideoStudent};
+
+pub mod sample;
 
 pub struct TrainSettings {
     /// Steps to run in *this* invocation (one chunk of a possibly longer run).
@@ -41,10 +43,18 @@ pub struct TrainSettings {
     /// Max decoded shards held resident by the lazy loader. Bounds RAM so shard
     /// counts can grow into the thousands without loading the whole cache up front.
     pub shard_cache: usize,
+    /// Shards whose gradients are summed before one optimizer step — the effective
+    /// batch size. The loop is otherwise strictly one shard per step, which for a
+    /// 383M model is a real handicap rather than a detail: with batch 1 the
+    /// gradient is dominated by which single (clip, sigma) draw the cursor
+    /// happened to land on, and the loss plateaus at the level that noise
+    /// supports. Accumulating trades steps for signal at identical memory, since
+    /// the activations of each micro-step are freed before the next one runs.
+    pub accum: usize,
 }
 impl Default for TrainSettings {
     fn default() -> Self {
-        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128 }
+        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128, accum: 1 }
     }
 }
 
@@ -79,7 +89,7 @@ pub struct Sample {
     pub relations: Vec<(Vec<f32>, [usize; 3])>,
 }
 
-fn floats(v: &TensorView) -> Result<Vec<f32>> {
+pub(crate) fn floats(v: &TensorView) -> Result<Vec<f32>> {
     Ok(match v.dtype() {
         Dtype::F32 => v.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         Dtype::F16 => v.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
@@ -147,10 +157,10 @@ impl ShardCache {
     }
 }
 
-fn t3<B: Backend>(x: &(Vec<f32>, [usize; 3]), device: &B::Device) -> Tensor<B, 3> {
+pub(crate) fn t3<B: Backend>(x: &(Vec<f32>, [usize; 3]), device: &B::Device) -> Tensor<B, 3> {
     Tensor::<B, 1>::from_floats(x.0.as_slice(), device).reshape(x.1)
 }
-fn t5<B: Backend>(x: &(Vec<f32>, [usize; 5]), device: &B::Device) -> Tensor<B, 5> {
+pub(crate) fn t5<B: Backend>(x: &(Vec<f32>, [usize; 5]), device: &B::Device) -> Tensor<B, 5> {
     Tensor::<B, 1>::from_floats(x.0.as_slice(), device).reshape(x.1)
 }
 fn mse<B: Backend, const D: usize>(a: Tensor<B, D>, b: Tensor<B, D>) -> Tensor<B, 1> {
@@ -279,27 +289,9 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     // well past "one odd shard" and clearly into "this run is dead".
     const MAX_CONSECUTIVE_NON_FINITE: u32 = 5;
     let mut consecutive_non_finite: u32 = 0;
+    let accum = s.accum.max(1);
     for i in 1..=chunk {
         let step = start_step + i;
-        let sample = shards.get((step - 1) % num_shards)?;
-        let noisy = t5::<B>(&sample.noisy, device);
-        let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device).reshape([sample.timestep.len(), 1]);
-        let prompt = t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
-        let teacher = t5::<B>(&sample.teacher_pred, device);
-
-        let (pred, hidden) = model.forward(noisy, timestep, prompt);
-        let output = mse(pred.clone(), teacher.clone());
-        let temporal = if sample.noisy.1[2] > 1 { mse(temporal_difference(pred), temporal_difference(teacher)) } else { output.zeros_like() };
-        let feature = if sample.relations.is_empty() { output.zeros_like() } else {
-            let pairs = sample.relations.len().min(hidden.len());
-            let si = linspace_idx(hidden.len(), pairs);
-            let ti = linspace_idx(sample.relations.len(), pairs);
-            let mut acc = output.zeros_like();
-            for (a, b) in si.iter().zip(&ti) { acc = acc + mse(relation(hidden[*a].clone()), t3::<B>(&sample.relations[*b], device)); }
-            acc.div_scalar(pairs as f32)
-        };
-        let loss = output.clone().mul_scalar(s.w_output) + temporal.clone().mul_scalar(s.w_temporal) + feature.clone().mul_scalar(s.w_feature);
-
         // Tests the actual theory (unbounded residual-stream growth from the
         // time/text conditioning injected before block 0, raised after the
         // step-349 investigation) directly, as a trend, rather than waiting to
@@ -316,18 +308,73 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
                 Err(_) => (f32::NAN, f32::NAN),
             }
         };
-        let (layer0_norm, layer0_max) = hidden_stats(&hidden[0]);
-        let (layerlast_norm, layerlast_max) = hidden_stats(&hidden[hidden.len() - 1]);
+        let (mut layer0_norm, mut layer0_max) = (f32::NAN, f32::NAN);
+        let (mut layerlast_norm, mut layerlast_max) = (f32::NAN, f32::NAN);
+        let mut accumulator = GradientsAccumulator::new();
+        let mut m = StepMetrics { output: 0.0, temporal: 0.0, feature: 0.0, total: 0.0 };
+        let mut non_finite_layer: Option<Option<usize>> = None;
 
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
-        model = optim.step(s.lr, model, grads);
+        for micro in 0..accum {
+            // Shard selection stays a pure function of (step, micro), so a resumed
+            // chunked run still draws the identical sequence — with accum=1 this
+            // is exactly the original `(step-1) % len`.
+            let sample = shards.get(((step - 1) * accum + micro) % num_shards)?;
+            let noisy = t5::<B>(&sample.noisy, device);
+            let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device).reshape([sample.timestep.len(), 1]);
+            let prompt = t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
+            let teacher = t5::<B>(&sample.teacher_pred, device);
 
-        let m = StepMetrics {
-            output: output.into_scalar().elem::<f32>(),
-            temporal: temporal.into_scalar().elem::<f32>(),
-            feature: feature.into_scalar().elem::<f32>(),
-            total: loss.into_scalar().elem::<f32>(),
-        };
+            let (pred, hidden) = model.forward(noisy, timestep, prompt);
+            let output = mse(pred.clone(), teacher.clone());
+            let temporal = if sample.noisy.1[2] > 1 { mse(temporal_difference(pred), temporal_difference(teacher)) } else { output.zeros_like() };
+            let feature = if sample.relations.is_empty() { output.zeros_like() } else {
+                let pairs = sample.relations.len().min(hidden.len());
+                let si = linspace_idx(hidden.len(), pairs);
+                let ti = linspace_idx(sample.relations.len(), pairs);
+                let mut acc = output.zeros_like();
+                for (a, b) in si.iter().zip(&ti) { acc = acc + mse(relation(hidden[*a].clone()), t3::<B>(&sample.relations[*b], device)); }
+                acc.div_scalar(pairs as f32)
+            };
+            // Scale here, not after summing: each micro-step's gradient enters the
+            // accumulator already divided, so the accumulated gradient is the mean
+            // over the batch and `lr` keeps the same meaning at any `accum`.
+            let loss = (output.clone().mul_scalar(s.w_output)
+                + temporal.clone().mul_scalar(s.w_temporal)
+                + feature.clone().mul_scalar(s.w_feature))
+                .div_scalar(accum as f32);
+
+            if micro == 0 {
+                (layer0_norm, layer0_max) = hidden_stats(&hidden[0]);
+                (layerlast_norm, layerlast_max) = hidden_stats(&hidden[hidden.len() - 1]);
+            }
+
+            accumulator.accumulate(&model, GradientsParams::from_grads(loss.backward(), &model));
+
+            let (o, t, f) = (
+                output.into_scalar().elem::<f32>(),
+                temporal.into_scalar().elem::<f32>(),
+                feature.into_scalar().elem::<f32>(),
+            );
+            // Which micro-step blew up, and in which layer, has to be captured
+            // here: `hidden` does not outlive this iteration, and with accum > 1
+            // "the step went non-finite" no longer identifies a single sample.
+            if !(o * s.w_output + t * s.w_temporal + f * s.w_feature).is_finite() && non_finite_layer.is_none() {
+                non_finite_layer = Some(hidden.iter().position(|h| {
+                    h.clone().to_data().to_vec::<f32>().map(|v| v.iter().any(|x| !x.is_finite())).unwrap_or(false)
+                }));
+            }
+            m.output += o / accum as f32;
+            m.temporal += t / accum as f32;
+            m.feature += f / accum as f32;
+        }
+        m.total = m.output * s.w_output + m.temporal * s.w_temporal + m.feature * s.w_feature;
+
+        // Non-finite is decided before the update, exactly as before: skipping the
+        // step must leave the weights untouched, which is only true while
+        // `optim.step` has not run.
+        if m.total.is_finite() {
+            model = optim.step(s.lr, model, accumulator.grads());
+        }
         history.push(m.total);
         state.steps_done = step;
         state.last_loss = m.total;
@@ -363,13 +410,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             // non-finite value, so a recurring failure points at a specific layer
             // instead of just "step N, feature went NaN" again. Read-back cost is
             // only paid on the (rare) non-finite path, never on a healthy step.
-            let bad_layer = hidden.iter().position(|h| {
-                h.clone()
-                    .to_data()
-                    .to_vec::<f32>()
-                    .map(|v| v.iter().any(|x| !x.is_finite()))
-                    .unwrap_or(false)
-            });
+            let bad_layer = non_finite_layer.flatten();
             let diag = serde_json::json!({
                 "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature,
                 "total": serde_json::Value::Null, "non_finite_layer": bad_layer,
@@ -431,9 +472,9 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
 }
 
 /// Deterministic Gaussian source (same LCG family as `video-web`).
-struct Lcg { state: u32, spare: Option<f32> }
+pub struct Lcg { state: u32, spare: Option<f32> }
 impl Lcg {
-    fn new(seed: u32) -> Self { Self { state: seed.max(1), spare: None } }
+    pub fn new(seed: u32) -> Self { Self { state: seed.max(1), spare: None } }
     fn next_f32(&mut self) -> f32 { self.state = self.state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); ((self.state >> 8) as f32) / ((1u32 << 24) as f32) }
     fn normal(&mut self) -> f32 {
         if let Some(v) = self.spare.take() { return v; }
@@ -444,7 +485,7 @@ impl Lcg {
         self.spare = Some(r * a.sin());
         r * a.cos()
     }
-    fn vec(&mut self, n: usize) -> Vec<f32> { (0..n).map(|_| self.normal()).collect() }
+    pub fn vec(&mut self, n: usize) -> Vec<f32> { (0..n).map(|_| self.normal()).collect() }
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
@@ -749,6 +790,34 @@ mod tests {
             .map(|p| load_shard(&cache.join(p), &manifest.hidden_relation_layers).unwrap().timestep)
             .collect();
         assert!(ts.iter().any(|t| t != &ts[0]), "draws within reach must vary the timestep");
+    }
+
+    // Gradient accumulation must be a real batch, not a slower way to do batch 1:
+    // one optimizer step has to consume `accum` distinct shards. The cursor is
+    // `((step-1)*accum + micro) % len`, so 4 steps at accum=4 must walk all 16
+    // shards exactly once — if it collapsed to the first shard of each group, the
+    // run would silently train on a quarter of the cache.
+    #[test]
+    fn accumulation_consumes_a_full_batch_of_distinct_shards() {
+        let _seed = seed_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let out = dir.path().join("run");
+        let spec = tiny_spec();
+        synth_cache(&spec, &cache, 4, 2, 4, 4, 4, 12, 2, 3, 4).unwrap();
+        assert_eq!(validate_cache(&cache).unwrap().shards.len(), 16);
+
+        let settings = TrainSettings { steps: 4, lr: 1e-2, accum: 4, log_every: 100, ..Default::default() };
+        let (losses, state) = train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &NdArrayDevice::default()).unwrap();
+        assert_eq!(losses.len(), 4, "one loss per optimizer step, not per micro-step");
+        assert_eq!(state.steps_done, 4);
+        assert!(losses.iter().all(|l| l.is_finite()), "accumulated run diverged: {losses:?}");
+        assert!(losses.last().unwrap() < losses.first().unwrap(), "loss did not fall: {losses:?}");
+
+        // Cursor coverage, checked directly rather than inferred from the loss.
+        let touched: std::collections::HashSet<usize> =
+            (1..=4usize).flat_map(|step| (0..4).map(move |m| ((step - 1) * 4 + m) % 16)).collect();
+        assert_eq!(touched.len(), 16, "accum=4 over 4 steps must touch every shard once");
     }
 
     #[test]

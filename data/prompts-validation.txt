@@ -1,0 +1,13 @@
+# Validation captions for the teacher-cache -> Rust-student round.
+# Chosen to be visually unambiguous at low resolution and to carry obvious motion,
+# so "did the student learn this clip" can be answered by looking at eight frames
+# rather than by trusting a loss curve. Distinct dominant colours across clips
+# make a collapsed / prompt-ignoring student immediately visible.
+A red sports car driving fast along a coastal road, sunny day
+A large orange bonfire burning at night, sparks rising
+Ocean waves crashing onto a rocky shore, white foam
+A yellow hot air balloon rising over green fields
+A person in a blue jacket walking through heavy snowfall
+Close-up of a purple flower swaying in the wind
+A white cat walking across a wooden floor
+City traffic at night, streaks of red and white headlights
