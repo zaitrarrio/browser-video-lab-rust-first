@@ -300,6 +300,25 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         };
         let loss = output.clone().mul_scalar(s.w_output) + temporal.clone().mul_scalar(s.w_temporal) + feature.clone().mul_scalar(s.w_feature);
 
+        // Tests the actual theory (unbounded residual-stream growth from the
+        // time/text conditioning injected before block 0, raised after the
+        // step-349 investigation) directly, as a trend, rather than waiting to
+        // see whether it eventually crashes. Read before backward() — this is
+        // the forward-pass hidden state, unaffected by whether this step's
+        // update later gets applied or skipped.
+        let hidden_stats = |h: &Tensor<B, 3>| -> (f32, f32) {
+            match h.clone().to_data().to_vec::<f32>() {
+                Ok(v) => {
+                    let sumsq: f32 = v.iter().map(|x| x * x).sum();
+                    let maxabs = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+                    (sumsq.sqrt(), maxabs)
+                }
+                Err(_) => (f32::NAN, f32::NAN),
+            }
+        };
+        let (layer0_norm, layer0_max) = hidden_stats(&hidden[0]);
+        let (layerlast_norm, layerlast_max) = hidden_stats(&hidden[hidden.len() - 1]);
+
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         model = optim.step(s.lr, model, grads);
 
@@ -313,7 +332,11 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         state.steps_done = step;
         state.last_loss = m.total;
         if m.total < state.best_loss { state.best_loss = m.total; }
-        let line = serde_json::json!({"step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "total": m.total});
+        let line = serde_json::json!({
+            "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "total": m.total,
+            "layer0_norm": layer0_norm, "layer0_max": layer0_max,
+            "layerlast_norm": layerlast_norm, "layerlast_max": layerlast_max,
+        });
         if i % s.log_every.max(1) == 0 || i == 1 {
             println!("{line}");
         }
