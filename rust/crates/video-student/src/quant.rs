@@ -139,7 +139,7 @@ mod tests {
     type Cpu = NdArray<f32>;
 
     fn spec() -> StudentSpec {
-        StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2] }
+        StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2], per_block_conditioning: false }
     }
     fn inputs(device: &NdArrayDevice) -> (Tensor<Cpu, 5>, Tensor<Cpu, 2>, Tensor<Cpu, 3>) {
         let latents = Tensor::<Cpu, 1>::from_floats([0.4f32; 2 * 1 * 4 * 4].as_slice(), device).reshape([1, 2, 1, 4, 4]);

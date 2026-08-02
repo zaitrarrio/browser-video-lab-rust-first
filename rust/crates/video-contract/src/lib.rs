@@ -37,6 +37,16 @@ pub struct StudentSpec {
     /// count `ph*pw`× and lines the relation grams up with a Wan teacher.
     #[serde(default = "default_patch")]
     pub patch_size: [usize; 3],
+    /// Modulate every block with the (σ, prompt) conditioning vector — adaLN-zero,
+    /// as every DiT in this family does — instead of adding it once at the stem.
+    ///
+    /// Default `false` keeps the historical architecture and lets every existing
+    /// spec and checkpoint load unchanged, so the two are an A/B rather than a
+    /// migration. Round 1 recorded parity that was flat across σ and suspected the
+    /// single stem injection of being a ceiling rather than a symptom of
+    /// undertraining; this flag is what makes that testable.
+    #[serde(default)]
+    pub per_block_conditioning: bool,
 }
 
 impl StudentSpec {
@@ -69,5 +79,5 @@ pub fn validate_cache(root: &Path) -> Result<TeacherCacheManifest> {
 }
 
 #[cfg(test)]
-mod tests { use super::*; #[test] fn estimates_browser_student(){ let s=StudentSpec{latent_channels:16,text_width:4096,width:1152,layers:24,heads:16,mlp_ratio:4,max_tokens:6144,patch_size:[1,2,2]}; assert!(s.approximate_parameters()>380_000_000); assert!(s.validate().is_ok()); } }
+mod tests { use super::*; #[test] fn estimates_browser_student(){ let s=StudentSpec{latent_channels:16,text_width:4096,width:1152,layers:24,heads:16,mlp_ratio:4,max_tokens:6144,patch_size:[1,2,2],per_block_conditioning:false}; assert!(s.approximate_parameters()>380_000_000); assert!(s.validate().is_ok()); } }
 

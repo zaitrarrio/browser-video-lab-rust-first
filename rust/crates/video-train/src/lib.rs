@@ -850,7 +850,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     fn tiny_spec() -> StudentSpec {
-        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256, patch_size: [1, 2, 2] }
+        StudentSpec { latent_channels: 2, text_width: 8, width: 16, layers: 2, heads: 2, mlp_ratio: 2, max_tokens: 256, patch_size: [1, 2, 2], per_block_conditioning: false }
     }
 
     // `Backend::seed` sets a *process-global* RNG, so two tests training on the
@@ -862,7 +862,6 @@ mod tests {
         SEED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[test]
     // Sustained divergence (weights genuinely destroyed, e.g. by one catastrophic
     // update from too high an lr) must still stop the run and must not overwrite
     // the last good checkpoint with NaN weights. The first real Kaggle chunk
@@ -900,7 +899,6 @@ mod tests {
         assert!(state.last_loss.is_finite(), "NaN was persisted as the run state");
     }
 
-    #[test]
     // An isolated non-finite step — the weights are fine, but one specific
     // (data, hidden-state) interaction blew up — must recover: skip that step's
     // update and keep training, rather than losing the whole chunk to one blip.
