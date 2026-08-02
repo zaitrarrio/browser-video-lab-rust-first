@@ -52,6 +52,49 @@ def test_synthetic_dataset_then_toy_cache(tmp_path):
     assert "teacher_relation.3" not in shard
 
 
+def test_draw_batching_reproduces_the_unbatched_cache(tmp_path):
+    """`--draw-batch` must be a scheduling change, not a data change.
+
+    Batching draws into one teacher forward is worth ~18% (docs/PERF-ROUND-1.md),
+    but it rewrites the loop that decides what every shard contains, and the failure
+    mode is silent: a cache whose inputs no longer match its seeds still trains, just
+    to the wrong thing. The per-draw generator is seeded from (clip, draw), so the
+    inputs must come out bit-identical however they are grouped; only the teacher's
+    own output is allowed to move, and only by GEMM reduction order.
+    """
+    data = tmp_path / "data"
+    _run("longlive_distill.make_dataset", "--synthetic", "--output", str(data),
+         "--count", "2", "--seq", "4", "--teacher-width", "4096", "--student-width", "16",
+         "--latent-shape", "16", "2", "4", "4")
+
+    caches = {}
+    for batch in (1, 8):
+        out = tmp_path / f"cache-b{batch}"
+        _run("longlive_distill.cache_teacher",
+             "--adapter", "wan21_teacher_adapter:build_teacher", "--adapter-arg", "toy=true",
+             "--dataset", str(data), "--output", str(out),
+             "--draws-per-clip", "8", "--draw-batch", str(batch), "--relation-layers", "2")
+        caches[batch] = (out, json.loads((out / "manifest.json").read_text()))
+
+    (dir1, m1), (dir8, m8) = caches[1], caches[8]
+    assert m1["shards"] == m8["shards"], "batching must not change shard count or order"
+    assert m1["scheduler"] == m8["scheduler"]
+
+    for name in m1["shards"]:
+        a, b = load_file(dir1 / name), load_file(dir8 / name)
+        assert a.keys() == b.keys(), f"{name}: different tensors"
+        # Inputs are built on the CPU from the seeded generator and must be exact —
+        # if these ever differ, the cache is being fed something other than what its
+        # seed says, which no tolerance should paper over.
+        for key in ("noisy_latents", "timestep", "prompt_embeds"):
+            assert torch.equal(a[key], b[key]), f"{name}/{key} changed under batching"
+        # The teacher's output may move at reduction-order level only.
+        assert torch.allclose(a["teacher_noise_pred"], b["teacher_noise_pred"], rtol=1e-4, atol=1e-5), \
+            f"{name}: teacher_noise_pred moved more than reduction order explains"
+        for key in (k for k in a if k.startswith("teacher_relation.")):
+            assert torch.allclose(a[key].float(), b[key].float(), rtol=1e-3, atol=1e-3), f"{name}/{key}"
+
+
 def test_draws_vary_the_timestep(tmp_path):
     data, cache = tmp_path / "data", tmp_path / "cache"
     _run("longlive_distill.make_dataset", "--synthetic", "--output", str(data),

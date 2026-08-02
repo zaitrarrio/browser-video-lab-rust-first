@@ -73,6 +73,16 @@ def main():
                    help='>0 caches the CFG-combined velocity uncond + w*(cond-uncond) instead of the bare '
                         'conditional one. Costs a second teacher pass per shard and is what lets the student '
                         'be sampled without running CFG itself.')
+    p.add_argument('--teacher-dtype', choices=['f32', 'bf16', 'f16'], default='f32',
+                   help='element type the teacher runs in. bf16 is 2.6x faster than f32 (the single '
+                        'largest lever measured — docs/PERF-ROUND-1.md) and is the precision Wan was '
+                        'trained in and that make_wan_dataset.py already generates the latents with. It '
+                        'is NOT free: cached targets differ from the f32 ones by ~7% mean relative error, '
+                        'so validate against parity_baseline.py before building a large cache with it.')
+    p.add_argument('--draw-batch', type=int, default=8,
+                   help='draws evaluated in one teacher forward. Worth +18%%; the throughput knee is at '
+                        '4-8 and batch 16 doubles VRAM for under 1%%, so 8 is the measured setting. '
+                        '1 restores the historical one-forward-per-draw behaviour.')
     a = p.parse_args()
 
     cfg: dict = {}
@@ -82,6 +92,12 @@ def main():
             cfg[key] = json.loads(value)
         except json.JSONDecodeError:
             cfg[key] = value
+    # The adapter builds in the requested element type rather than being cast after
+    # the fact: `from_pretrained(torch_dtype=...)` is what was measured, and casting
+    # a built module converts parameters the loader deliberately left in f32.
+    TDT = {'f32': torch.float32, 'bf16': torch.bfloat16, 'f16': torch.float16}[a.teacher_dtype]
+    if TDT is not torch.float32:
+        cfg.setdefault('dtype', TDT)
     teacher = resolve(a.adapter)(cfg).to(a.device).eval()
 
     out = Path(a.output)
@@ -106,7 +122,12 @@ def main():
                     f'--guidance {a.guidance} needs negative_prompt_embeds in {file.name}; '
                     'build the dataset with make_wan_dataset.py, which stores them'
                 )
-            for draw in range(max(1, a.draws_per_clip)):
+            # Every draw's input is built up front so a batch of them can go through
+            # the teacher in one forward. The generator is seeded per (clip, draw),
+            # so batching reproduces exactly the values the one-at-a-time loop
+            # produced — only the kernel's reduction order differs.
+            draws, noisy_all, t_all = max(1, a.draws_per_clip), [], []
+            for draw in range(draws):
                 g = torch.Generator().manual_seed(a.seed + i * 9973 + draw)
                 noise = torch.randn(lat.shape, generator=g)
                 if a.noising == 'flow':
@@ -121,37 +142,57 @@ def main():
                     s = a.shift * u / (1 + (a.shift - 1) * u) if a.shift > 0 else u
                     t = (s * 1000).round().clamp(0, 999).to(torch.int64)
                     sigma = s.view(-1, *([1] * (lat.dim() - 1)))
-                    noisy = (1 - sigma) * lat + sigma * noise
+                    noisy_all.append((1 - sigma) * lat + sigma * noise)
                 else:
                     t = torch.randint(0, 1000, (lat.shape[0],), generator=g)
                     sigma = (t.float() / 1000).view(-1, *([1] * (lat.dim() - 1)))
-                    noisy = lat + noise * sigma
-                result = teacher(noisy.to(a.device), t.to(a.device), prompt.to(a.device))
+                    noisy_all.append(lat + noise * sigma)
+                t_all.append(t)
+            noisy_all, t_all = torch.cat(noisy_all, 0), torch.cat(t_all, 0)
+
+            for off in range(0, draws, max(1, a.draw_batch)):
+                noisy = noisy_all[off:off + max(1, a.draw_batch)]
+                t = t_all[off:off + max(1, a.draw_batch)]
+                n = noisy.shape[0]
+                # Inputs are cast to the teacher's element type explicitly. Sniffing
+                # it from the module does not work: under `torch_dtype=bfloat16`
+                # diffusers leaves some Wan parameters in f32, so the first one says
+                # f32 while the patch embedding — which rejects an f32 input — is
+                # bf16.
+                nd, td = noisy.to(a.device, dtype=TDT), t.to(a.device)
+                pc = prompt.to(a.device, dtype=TDT).expand(n, *prompt.shape[1:])
+                result = teacher(nd, td, pc)
                 target = result['noise_pred'].float()
                 if a.guidance > 0:
-                    uncond = teacher(noisy.to(a.device), t.to(a.device), negative.float().to(a.device))
-                    target = uncond['noise_pred'].float() + a.guidance * (target - uncond['noise_pred'].float())
-                tensors = {
-                    'noisy_latents': noisy.cpu().contiguous(),
-                    'timestep': t.cpu().contiguous(),
-                    'prompt_embeds': prompt.half().cpu().contiguous(),
-                    'teacher_noise_pred': target.cpu().contiguous(),
-                }
-                if student_prompt is not None:
-                    tensors['student_prompt_embeds'] = student_prompt.float().cpu().contiguous()
+                    # Deliberately a second forward rather than one batch of 2n:
+                    # concatenating cond and uncond measured 8% *slower*, because
+                    # the teacher pass is already compute-bound and the extra input
+                    # materialisation costs more than the saved launch.
+                    pu = negative.float().to(a.device, dtype=TDT).expand(n, *negative.shape[1:])
+                    uncond = teacher(nd, td, pu)['noise_pred'].float()
+                    target = uncond + a.guidance * (target - uncond)
                 hidden = result.get('hidden_states', [])
                 selected = select_layers(len(hidden), a.relation_layers)
-                for out_idx, layer in enumerate(selected):
-                    h = torch.nn.functional.normalize(hidden[layer].float(), dim=-1)
-                    tensors[f'teacher_relation.{out_idx}'] = (h @ h.transpose(-1, -2)).half().cpu().contiguous()
                 num_layers = len(selected)
-                name = f'shard-{k:06d}.safetensors'
-                save_file(tensors, out / name)
-                shards.append(name)
-                k += 1
-                if not shapes:
-                    for key, value in tensors.items():
-                        shapes[key] = {'name': key, 'shape': list(value.shape), 'dtype': str(value.dtype).replace('torch.', '').upper()}
+                for b in range(n):
+                    tensors = {
+                        'noisy_latents': noisy[b:b + 1].contiguous(),
+                        'timestep': t[b:b + 1].contiguous(),
+                        'prompt_embeds': prompt.half().cpu().contiguous(),
+                        'teacher_noise_pred': target[b:b + 1].cpu().contiguous(),
+                    }
+                    if student_prompt is not None:
+                        tensors['student_prompt_embeds'] = student_prompt.float().cpu().contiguous()
+                    for out_idx, layer in enumerate(selected):
+                        h = torch.nn.functional.normalize(hidden[layer][b:b + 1].float(), dim=-1)
+                        tensors[f'teacher_relation.{out_idx}'] = (h @ h.transpose(-1, -2)).half().cpu().contiguous()
+                    name = f'shard-{k:06d}.safetensors'
+                    save_file(tensors, out / name)
+                    shards.append(name)
+                    k += 1
+                    if not shapes:
+                        for key, value in tensors.items():
+                            shapes[key] = {'name': key, 'shape': list(value.shape), 'dtype': str(value.dtype).replace('torch.', '').upper()}
 
     # The scheduler string is the cache's own record of the convention its targets
     # were built under. A student trained on `flow` targets and sampled as if they
@@ -159,6 +200,12 @@ def main():
     scheduler = a.scheduler if a.noising == 'legacy' else f'{a.scheduler}-flow-shift{a.shift:g}'
     if a.guidance > 0:
         scheduler += f'-cfg{a.guidance:g}'
+    # Teacher precision belongs in that record for the same reason: bf16 targets
+    # differ from f32 ones by ~7% mean relative error, which is far too small to
+    # notice by eye in a shard and far too large to be a rounding detail when two
+    # caches get compared or concatenated.
+    if a.teacher_dtype != 'f32':
+        scheduler += f'-{a.teacher_dtype}'
 
     manifest = {
         'format_version': 1,

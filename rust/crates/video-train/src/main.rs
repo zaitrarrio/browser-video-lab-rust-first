@@ -22,15 +22,19 @@ enum Precision {
     /// IEEE binary16: 11-bit significand, max magnitude 65504. Half the
     /// bandwidth of f32 and the only half format wgpu can do arithmetic in.
     ///
-    /// Measured unstable for training the 383M student *with `--grad-clip`
-    /// active*: burn's `clip_by_norm` reduces `sum(g^2)` in the gradient's own
-    /// dtype, and a multi-million-element f16 tensor cannot hold that sum, so
-    /// each step rescales parameter groups by a coefficient derived from a
-    /// wrong norm. The loss rises to 4-10x its start around steps 10-30 and
-    /// never trips the non-finite guard — it fails quietly, which is worse.
-    /// The same run at `--grad-clip 1e30` (clipping inert) descends normally.
-    /// Prefer bf16 for training; f16 is fine for `sample`/`eval`, which do no
-    /// gradient work at all.
+    /// Measured unusable for training the 383M student, and `train` therefore
+    /// refuses it (see `require_trainable`).
+    ///
+    /// An earlier reading blamed `clip_by_norm` reducing `sum(g^2)` in f16 and
+    /// reported that `--grad-clip 1e30` cured it. On a real teacher cache it does
+    /// not: the run goes non-finite and hard-fails with clipping inert, and the
+    /// diagnostic names hidden layer 0 — a forward-pass overflow, not a
+    /// gradient-norm artifact. 65504 is simply not enough headroom for this
+    /// model's residual stream, whose deepest-layer norm climbs past 22000 in
+    /// 40 steps. `docs/PERF-ROUND-1.md` has the runs.
+    ///
+    /// Still offered for `sample`/`eval`, which do no gradient work and integrate
+    /// far fewer steps.
     F16,
     /// bfloat16: 8-bit significand, f32's exponent range. Trades mantissa bits
     /// for the dynamic range that makes f16 overflow, and is CUDA-only here
@@ -88,6 +92,31 @@ fn require_dtype<B: Backend>(device: &B::Device, backend: &str, precision: Preci
         precision.name(),
         usable.join(" | "),
     )
+}
+
+/// Refuse f16 for `train` specifically.
+///
+/// Not defensive padding: on a real teacher cache (`wan21-flow-shift3`, 383M
+/// student, 40 steps x accum 8) f16 goes non-finite at step 8 and hard-fails at
+/// step 12 on the five-in-a-row guard, and does so again with `--grad-clip 1e30`,
+/// so the clipper is not what breaks it. A flag whose only outcome is a run that
+/// dies a third of the way in is a trap, and the failure costs whatever GPU time
+/// it took to get there. bf16 has the same memory saving, stays within 1% of
+/// f32's loss curve, and is bit-reproducible.
+///
+/// `--allow-f16-training` exists so the failure can still be reproduced (it is how
+/// the finding in `docs/PERF-ROUND-1.md` was made) without editing the source.
+fn require_trainable(precision: Precision, allow: bool) -> Result<()> {
+    if precision == Precision::F16 && !allow {
+        bail!(
+            "--precision f16 is not usable for training this student: it goes non-finite \
+             within ~10 steps and hard-fails, with or without gradient clipping (the \
+             overflow is in the forward pass, at hidden layer 0 — see \
+             docs/PERF-ROUND-1.md). Use --precision bf16 for the same memory saving with \
+             a usable loss curve, or pass --allow-f16-training to reproduce the failure."
+        );
+    }
+    Ok(())
 }
 
 /// The ndarray backend has no half-precision instantiation to dispatch to:
@@ -225,6 +254,9 @@ enum Command {
         /// queue — so a profiled run is slower than the same run without this.
         /// Use it to find the bottleneck, not to quote throughput.
         #[arg(long, default_value_t = false)] profile: bool,
+        /// Run `--precision f16` for training anyway. It hard-fails within ~10
+        /// steps; this exists only to reproduce that.
+        #[arg(long, default_value_t = false)] allow_f16_training: bool,
     },
     /// Integrate the trained student's velocity field from noise to a clean latent
     /// and write it as safetensors for a VAE decode. This is the step that turns
@@ -271,7 +303,11 @@ fn main() -> Result<()> {
             synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip)?;
             println!("wrote {} synthetic shards to {}", shards * draws_per_clip, output.display());
         }
-        Command::Train { spec, cache, output, backend, precision, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile } => {
+        Command::Train { spec, cache, output, backend, precision, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile, allow_f16_training } => {
+            // Before the cache is opened or a weight allocated, as with the other
+            // precision guards: the point is to cost nothing rather than to fail
+            // ten steps into a GPU run.
+            require_trainable(precision, allow_f16_training)?;
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
             let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile };
             let (losses, state) = dispatch!(run_train, &backend, precision, (spec, &cache, &output, &settings))?;
