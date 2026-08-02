@@ -64,6 +64,25 @@ def require_internet():
         )
 
 
+def report_accelerator():
+    """Print what this host can actually run before spending a chunk finding out.
+
+    Backend choice is not free here. The CUDA backend (cubecl-cuda 0.10) panics
+    on Kaggle's GPU with "Memory page 0 doesn't exist" on every step and turns
+    the loss NaN by step 5 — the identical trainer, cache and hyperparameters run
+    clean on the wgpu backend over Vulkan. So the two things worth knowing up
+    front are whether the CUDA driver is there and whether a Vulkan ICD is:
+    Burn's wgpu backend needs the latter, and a container granted only the
+    nvidia-container-toolkit `compute,utility` capabilities will have a GPU and
+    no ICD at all. Seconds to print, and it turns "no adapter available" from a
+    guess into a fact.
+    """
+    sh("nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader", check=False)
+    for path in ("/etc/vulkan/icd.d", "/usr/share/vulkan/icd.d"):
+        sh(f'ls -1 {path} 2>/dev/null || echo "  (no {path})"', check=False)
+    sh('ls -1 /usr/lib/x86_64-linux-gnu/ 2>/dev/null | grep -iE "libcuda\\.so|libnvrtc|GLX_nvidia" || echo "  (no nvidia libs on the default path)"', check=False)
+
+
 def authenticate():
     """The `KGAT_…` token, from this kernel's own secrets. Required, not optional.
 
@@ -186,6 +205,7 @@ def restore_checkpoint() -> Path | None:
 
 def main():
     require_internet()
+    report_accelerator()
     authenticate()
     checkout_repo()
     trainer = restore_toolchain()

@@ -144,6 +144,14 @@ function sourceKey() {
     hash.update(readFileSync(file));
     hash.update("\0");
   }
+  // The cargo feature set decides which backends the binary actually contains,
+  // so it belongs in the key as much as the sources do. Without it, switching
+  // TRAIN_FEATURES scores a cache HIT and silently reuses a binary built for the
+  // other configuration — harmless in the direction that only *adds* a backend,
+  // and a "rebuild with --features cuda" failure in the other.
+  hash.update("features:");
+  hash.update(CONFIG.features);
+  hash.update("\0");
   return hash.digest("hex");
 }
 
