@@ -98,6 +98,20 @@ pub(crate) fn floats(v: &TensorView) -> Result<Vec<f32>> {
         d => bail!("unsupported dtype {d:?}"),
     })
 }
+/// Read a device tensor back to host f32 whatever the backend's float element is.
+///
+/// `TensorData::to_vec::<f32>` is a typed accessor, not a conversion: on an
+/// f16/bf16 backend it returns `TypeMismatch` and never a number. Every readback
+/// in this crate is a *diagnostic or an export* — hidden-state magnitudes, the
+/// non-finite layer hunt, the sampler's latent write, teacher-parity cosines —
+/// so under `--precision f16` the untyped version would have degraded all of them
+/// at once: NaN trend lines that look like divergence, and a sampler that fails
+/// after doing the whole integration. `convert` is a no-op when the data is
+/// already f32, so the default path pays nothing for this.
+pub(crate) fn read_f32<B: Backend, const D: usize>(t: Tensor<B, D>) -> Result<Vec<f32>, burn::tensor::DataError> {
+    t.into_data().convert::<f32>().to_vec::<f32>()
+}
+
 fn dims<const D: usize>(v: &TensorView, name: &str) -> Result<[usize; D]> {
     v.shape().try_into().map_err(|_| anyhow::anyhow!("{name}: expected rank {D}, got shape {:?}", v.shape()))
 }
@@ -229,6 +243,14 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     // f32::MAX, not INFINITY: serde_json writes a non-finite float as `null`, which
     // then fails to deserialize back into f32 and silently discards the run state.
     let mut state = TrainState { target_steps: s.target_steps, best_loss: f32::MAX, ..Default::default() };
+    // Report the element type the run *actually* resolved to, read off a real
+    // tensor rather than inferred from the flag. Burn 0.21 decides a tensor's
+    // dtype from the device's settings registry (defaulted from `B::FloatElem`
+    // and then locked by the first tensor created on that device), so "I passed
+    // --precision f16" and "this run is computing in f16" are two different
+    // claims. A throughput number attached to the wrong one is worthless, and
+    // this line is what makes the difference visible in the log.
+    eprintln!("float element in use: {:?}", Tensor::<B, 1>::zeros([1], device).dtype());
     // Seed before construction: this is the draw that decides the initial weights.
     B::seed(device, s.seed);
     let mut model = BrowserVideoStudent::<B>::new(spec.clone(), device);
@@ -299,7 +321,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         // the forward-pass hidden state, unaffected by whether this step's
         // update later gets applied or skipped.
         let hidden_stats = |h: &Tensor<B, 3>| -> (f32, f32) {
-            match h.clone().to_data().to_vec::<f32>() {
+            match read_f32(h.clone()) {
                 Ok(v) => {
                     let sumsq: f32 = v.iter().map(|x| x * x).sum();
                     let maxabs = v.iter().fold(0f32, |m, x| m.max(x.abs()));
@@ -360,7 +382,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             // "the step went non-finite" no longer identifies a single sample.
             if !(o * s.w_output + t * s.w_temporal + f * s.w_feature).is_finite() && non_finite_layer.is_none() {
                 non_finite_layer = Some(hidden.iter().position(|h| {
-                    h.clone().to_data().to_vec::<f32>().map(|v| v.iter().any(|x| !x.is_finite())).unwrap_or(false)
+                    read_f32(h.clone()).map(|v| v.iter().any(|x| !x.is_finite())).unwrap_or(false)
                 }));
             }
             m.output += o / accum as f32;
@@ -825,5 +847,85 @@ mod tests {
         assert_eq!(linspace_idx(4, 2), vec![0, 3]);
         assert_eq!(linspace_idx(24, 4), vec![0, 7, 15, 23]);
         assert_eq!(linspace_idx(1, 1), vec![0]);
+    }
+
+    // The half-precision backends are GPU-only, so the two facts `--precision`
+    // rests on are pinned here on CPU instead — where CI can actually run them.
+    //
+    // Fact one: `TensorData::to_vec::<f32>` is a typed accessor, not a
+    // conversion. Every readback in this crate went through it, and on an
+    // f16/bf16 backend each would have returned `TypeMismatch` — the
+    // hidden-state trend silently becoming NaN, the sampler hard-failing after
+    // a full integration. `read_f32` exists to close exactly this gap, so the
+    // test asserts both halves: that the naive call really does fail on
+    // non-f32 data, and that the helper really does recover the values.
+    #[test]
+    fn f32_readback_survives_a_non_f32_element_type() {
+        use burn::tensor::TensorData;
+
+        let half = TensorData::new(vec![half::f16::from_f32(1.5), half::f16::from_f32(-2.25)], [2]);
+        assert!(
+            half.to_vec::<f32>().is_err(),
+            "if to_vec::<f32> ever starts converting, read_f32 is redundant — delete it rather than \
+             leaving two ways to read a tensor back"
+        );
+        assert_eq!(half.convert::<f32>().to_vec::<f32>().unwrap(), vec![1.5f32, -2.25]);
+
+        // And the wrapper is a no-op on the default path: same values, no error.
+        let device = NdArrayDevice::default();
+        let t = Tensor::<NdArray<f32>, 1>::from_floats([0.5f32, -0.25].as_slice(), &device);
+        assert_eq!(read_f32(t).unwrap(), vec![0.5f32, -0.25]);
+    }
+
+    // Fact two: the checkpoint is f32 whatever the run computed in.
+    //
+    // `write_checkpoint` records with `FullPrecisionSettings`, and burn's
+    // `Record for Tensor` converts to the settings' float element on the way
+    // out — so a half-precision run still produces a record the f32 trainer and
+    // `video-web`'s `BinBytesRecorder<FullPrecisionSettings>` can load. That is
+    // the property the whole feature depends on and it must not be taken on
+    // faith, so it is exercised here with `NdArray<f64>`: not half precision,
+    // but the same thing being tested — a backend whose `FloatElem` is *not*
+    // the record's element type. If the recorder ever stopped casting, a f64
+    // (or f16) record would fail to load into the f32 model below.
+    #[test]
+    fn a_checkpoint_written_by_a_non_f32_backend_loads_into_the_f32_path() {
+        let _seed = seed_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let out = dir.path().join("run");
+        let spec = tiny_spec();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
+
+        let settings = TrainSettings { steps: 4, lr: 1e-2, log_every: 100, ..Default::default() };
+        let (losses, _) = train::<Autodiff<NdArray<f64, i64, i8>>>(
+            spec.clone(), &cache, &out, &settings, &NdArrayDevice::default(),
+        )
+        .expect("a non-f32 element type must train through the same code path");
+        assert!(losses.iter().all(|l| l.is_finite()), "f64 run diverged: {losses:?}");
+
+        // Both record formats, because they are read by different consumers:
+        // `student.mpk` by `--resume`, `student.bin` by the browser.
+        let device = NdArrayDevice::default();
+        for (file, is_mpk) in [("student.mpk", true), ("student.bin", false)] {
+            assert!(out.join(file).exists(), "{file} missing");
+            let model = BrowserVideoStudent::<NdArray<f32>>::new(spec.clone(), &device);
+            let loaded = if is_mpk {
+                model.load_file(out.join("student"), &NamedMpkFileRecorder::<FullPrecisionSettings>::default(), &device)
+            } else {
+                model.load_file(out.join("student"), &BinFileRecorder::<FullPrecisionSettings>::default(), &device)
+            }
+            .unwrap_or_else(|e| panic!("f32 model could not load {file} written by an f64 run: {e}"));
+
+            let latents = Tensor::<NdArray<f32>, 1>::from_floats([0.5f32; 2 * 2 * 4 * 4].as_slice(), &device).reshape([1, 2, 2, 4, 4]);
+            let timestep = Tensor::<NdArray<f32>, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
+            let prompt = Tensor::<NdArray<f32>, 1>::from_floats([0.1f32; 4 * 8].as_slice(), &device).reshape([1, 4, 8]);
+            let (pred, _) = loaded.forward(latents, timestep, prompt);
+            assert_eq!(pred.dims(), [1, 2, 2, 4, 4]);
+            assert!(
+                read_f32(pred).unwrap().iter().all(|v| v.is_finite()),
+                "{file} loaded but produced non-finite output — the cast on save mangled the weights"
+            );
+        }
     }
 }
