@@ -49,3 +49,6 @@ public/models/**/manifest.json
 bin/
 repo/
 run/
+
+# Claude Code session state and agent worktrees (each worktree is its own git repo)
+.claude/
