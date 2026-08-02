@@ -63,7 +63,7 @@ const titleFor = (slug) => slug.replace(/-/g, " ").replace(/^./, (c) => c.toUppe
 const CONFIG = {
   repo_url: env("REPO_URL"),
   commit: env("GITHUB_SHA", execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT }).toString().trim()),
-  spec: env("TRAIN_SPEC", "rust/config/browser-390m-umt5.json"),
+  spec: env("TRAIN_SPEC", "rust/config/validation-320.json"),
   backend: env("TRAIN_BACKEND", "cuda"),
   // Empty is a legitimate, distinct choice here (an ndarray/CPU build needs no
   // extra cargo feature), so this bypasses the strict env() helper — which

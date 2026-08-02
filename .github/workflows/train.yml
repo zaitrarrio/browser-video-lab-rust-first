@@ -96,7 +96,13 @@ jobs:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
-          TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}
+          # The same 390M umt5 student, with max_tokens raised to cover the 320x320
+          # operating point the teacher cache is now built at (4x40x40 = 6400 latent
+          # cells, over browser-390m-umt5.json's 6144 budget). 320x320 is the
+          # smallest resolution where Wan2.1-1.3B is itself coherent, so it is the
+          # cheapest geometry whose reference is worth matching — see
+          # docs/VALIDATION-ROUND-1.md. Keep this in step with the cache geometry.
+          TRAIN_SPEC: ${{ vars.TRAIN_SPEC || 'rust/config/validation-320.json' }}
           # The distillation LR. 2e-5 matches the reference config; 1e-4 diverges
           # (feature loss → NaN) even with grad-clip. Override via a repo variable
           # only if you change the spec/loss weights and re-tune.
@@ -133,7 +139,7 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
         run: |
           kaggle datasets download -d "${{ needs.chunk.outputs.checkpoint_dataset }}" -p ckpt --unzip
-          cp "${{ vars.TRAIN_SPEC || 'rust/config/browser-390m-umt5.json' }}" ckpt/student-spec.json
+          cp "${{ vars.TRAIN_SPEC || 'rust/config/validation-320.json' }}" ckpt/student-spec.json
           ls -la ckpt
           test -s ckpt/student.bin
 

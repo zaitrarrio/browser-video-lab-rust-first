@@ -1,0 +1,132 @@
+# Round-2 training captions: 128 clips spanning subject, scene, motion, palette
+# and lighting. Round 1 used 8 clips, which can only answer "can it memorize".
+# This set is still far short of a real distillation corpus, but it is wide
+# enough to separate "memorized the clips" from "learned the velocity field".
+A red sports car driving fast along a coastal road, sunny day
+A large orange bonfire burning at night, sparks rising
+Ocean waves crashing onto a rocky shore, white foam
+A yellow hot air balloon rising over green fields
+A person in a blue jacket walking through heavy snowfall
+Close-up of a purple flower swaying in the wind
+A white cat walking across a wooden floor
+City traffic at night, streaks of red and white headlights
+A waterfall pouring into a turquoise pool in a jungle
+Steam rising from a cup of black coffee on a table
+A golden retriever running across a grassy park
+Lightning flashing over a dark desert plain
+A wooden sailboat crossing a calm blue lake
+Autumn leaves falling in a quiet forest path
+A chef tossing vegetables in a hot pan, flames rising
+Neon signs reflecting in a wet city street at night
+A hummingbird hovering beside a red feeder
+Snow-capped mountains under fast-moving clouds
+A subway train arriving at a bright underground platform
+Rain droplets running down a window at dusk
+A field of sunflowers turning in the breeze
+A blacksmith hammering glowing orange metal
+Jellyfish drifting in deep blue water
+A hiker climbing a rocky ridge at sunrise
+A carousel spinning with colorful lights at a fair
+Bread dough rising in a warm kitchen
+A flock of birds taking off from a lake at dawn
+Lava flowing slowly down a black volcanic slope
+A cyclist speeding down a mountain trail, dust behind
+Candles flickering in a dark stone room
+A green lizard basking on a sunlit rock
+Traffic lights changing on an empty intersection
+A wave of wheat rippling across a summer field
+Fireworks bursting over a harbor at night
+A dolphin leaping out of clear blue water
+An old windmill turning against a grey sky
+A barista pouring latte art into a white cup
+Fog rolling over a pine forest at dawn
+A skateboarder grinding a concrete ledge
+Koi fish circling in a garden pond
+A hot air balloon festival at sunrise, many colors
+A train crossing a tall steel bridge over a river
+Butterflies landing on lavender in bright sun
+A drone shot over an emerald rice terrace
+Ice cracking on a frozen river in spring
+A street musician playing violin under lamplight
+A tiger walking through tall dry grass
+Sparks flying from a welding torch in a dark shop
+A ferris wheel turning against an orange sunset
+Rain falling on a red umbrella in a crowd
+A horse galloping across a wide open plain
+Bubbles rising in a glass of sparkling water
+An eagle soaring over a canyon at midday
+A potter shaping clay on a spinning wheel
+Cherry blossoms falling in a quiet park
+A lighthouse beam sweeping over dark water
+A busy market street with colorful fabric stalls
+Smoke curling from a chimney on a snowy roof
+A surfer riding inside a large blue wave
+Autumn mist over a still mountain lake
+A child running through a garden sprinkler
+Molten glass being blown into a round shape
+A pack of wolves moving through deep snow
+Rainbow forming over a green valley after rain
+A vintage typewriter being used, keys striking
+Seagulls circling above a fishing boat
+A campfire crackling beside a dark tent
+Wind turbines spinning on a coastal hill
+A chameleon slowly climbing a thin branch
+Sunlight breaking through clouds over the ocean
+A ballerina turning on a dim wooden stage
+Paint swirling in water, blue and magenta
+A steam locomotive pulling out of a station
+Fireflies glowing in a dark summer meadow
+A soccer ball hitting the back of a net
+Waves lapping against a white sand beach
+A hawk diving toward a grassy field
+Coffee beans tumbling in a roasting drum
+A glacier calving into cold grey water
+Street food sizzling on a night market grill
+A peacock spreading its tail feathers
+Rain on a tin roof, water streaming off the edge
+A hiker's lantern swinging on a dark trail
+Sand blowing across dunes at golden hour
+A whale surfacing beside a small boat
+Fresh snow falling on a quiet village street
+A dancer spinning with a flowing red dress
+Sparklers being waved in the dark
+A tram climbing a steep city hill
+Bees moving across a honeycomb frame
+A rocket lifting off with bright exhaust
+Leaves shaking in heavy summer rain
+A fox stepping carefully through fresh snow
+Ink spreading through clear water
+A crowded stadium with waving flags
+A river running fast over smooth stones
+An owl turning its head in a dark forest
+Clouds racing over a wide desert mesa
+A woman's hair blowing in strong coastal wind
+Popcorn popping in a hot glass kettle
+A bridge lit up over a river at night
+Ducks paddling across a still pond
+A drummer playing under stage lights
+Frost forming on a window in early morning
+A hot spring steaming in a snowy landscape
+A parrot flying between jungle branches
+Waves breaking against a stone pier in a storm
+A bicycle wheel spinning in bright sunlight
+Confetti falling over a cheering crowd
+A snake gliding through desert sand
+Rain clouds gathering over a wheat field
+A blacksmith quenching hot steel in water
+A monarch butterfly opening its wings
+Cars driving through a tunnel with orange lights
+A goat climbing a steep rocky cliff
+Waterlilies floating on a sunlit pond
+A kite flying high on a windy beach
+Espresso dripping into a small glass cup
+A deer stepping into a misty clearing
+Sunset over a city skyline, windows glowing
+A cargo ship moving through open sea
+Autumn wind scattering leaves down a street
+A crab scuttling across wet sand
+Stars rotating over a dark mountain ridge
+A gymnast tumbling across a blue mat
+Rain washing over green tropical leaves
+A candle being blown out, smoke rising
+A crowded escalator in a bright shopping mall
