@@ -92,6 +92,13 @@ def main():
             cfg[key] = json.loads(value)
         except json.JSONDecodeError:
             cfg[key] = value
+    # `--seed` seeds the global RNG too, not just the per-draw generators. The real
+    # teacher loads its weights, so this changes nothing there — but the toy teacher
+    # is randomly initialized `nn.Linear` layers, and without this two runs of this
+    # script build two *different* teachers. Any test that compares one invocation
+    # against another is then comparing weights, not the thing it meant to compare.
+    torch.manual_seed(a.seed)
+
     # The adapter builds in the requested element type rather than being cast after
     # the fact: `from_pretrained(torch_dtype=...)` is what was measured, and casting
     # a built module converts parameters the loader deliberately left in f32.
