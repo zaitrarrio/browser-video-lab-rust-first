@@ -138,9 +138,10 @@ pub fn sample<B: Backend>(a: &SampleArgs, device: &B::Device) -> Result<()> {
         println!("{}", serde_json::json!({"step": i + 1, "sigma": s, "sigma_next": s_next}));
     }
 
-    let values: Vec<f32> = latents
-        .into_data()
-        .to_vec::<f32>()
+    // Always written as f32 safetensors, whatever the run computed in: the file
+    // is consumed by a VAE decode outside this process, and a half-precision
+    // latent silently changing the output dtype would break that contract.
+    let values: Vec<f32> = crate::read_f32(latents)
         .map_err(|e| anyhow::anyhow!("latent readback failed: {e:?}"))?;
     let shape = vec![1, a.spec.latent_channels, a.frames, a.height, a.width];
     let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -181,7 +182,11 @@ pub fn evaluate<B: Backend>(spec: &StudentSpec, weights: &Path, cache: &Path, li
             .reshape([sample.timestep.len(), 1]);
         let prompt = crate::t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
         let (pred, _) = model.forward(noisy, timestep, prompt);
-        let p: Vec<f32> = pred.into_data().to_vec::<f32>().map_err(|e| anyhow::anyhow!("readback: {e:?}"))?;
+        // Widened to f32 before the dot products: the cosine is accumulated in
+        // f64 below precisely because a large-tensor reduction is where the
+        // precision goes, and doing it against half-precision inputs would mean
+        // reporting the readback's error as the student's.
+        let p: Vec<f32> = crate::read_f32(pred).map_err(|e| anyhow::anyhow!("readback: {e:?}"))?;
         let t = &sample.teacher_pred.0;
         let dot: f64 = p.iter().zip(t).map(|(a, b)| (*a as f64) * (*b as f64)).sum();
         let pn: f64 = p.iter().map(|a| (*a as f64) * (*a as f64)).sum::<f64>().sqrt();
