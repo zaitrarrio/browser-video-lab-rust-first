@@ -140,25 +140,68 @@ warm-up or repeats, so these are weaker evidence: base 1.91 s/clip, passing
 precomputed embeddings instead of re-encoding 1.78 s/clip (+6%), batching clips
 1.51 s/clip (+21%).
 
-## 4. What not to re-attempt
+## 4. The 18-GPU-day estimate, re-measured
+
+Round 1 costed the deliverable at **~18 GPU-days** from 2.04 samples/s (wgpu, f32,
+batch 8, 1600 tokens) against a 3.2M sample-view schedule. That number is what
+everything above is ultimately trying to move, so it was re-measured at exactly
+that geometry — same `validation-320` spec, same `[1,16,4,40,40]` latent, a real
+f32 teacher cache built at 320×320.
+
+| backend / precision / batch | samples/s | vs 2.04 | 3.2M views |
+| --- | --- | --- | --- |
+| wgpu f32, accum 8 (round 1) | 2.04 | — | 18.2 d |
+| cuda f32, accum 8 | 3.265 | 1.60× | 11.4 d |
+| cuda f32, accum 32 | 3.668 | 1.80× | 10.1 d |
+| cuda bf16, accum 8 | 4.103 | 2.01× | 9.0 d |
+| **cuda bf16, accum 32** | **5.000** | **2.45×** | **7.4 d** |
+
+**CUDA alone is 1.60×, not the ~3× an earlier cross-geometry comparison implied.**
+That estimate came from dividing a 1600-token wgpu figure by a 1024-token CUDA one
+and should not have been quoted as a backend multiplier.
+
+**bf16's value here is throughput, not memory.** Its gain grows with batch — +10.7%
+at accum 8, +18.6% at 16, +28.8% at 32, and +36.3% at accum 32 once warm-up is
+amortised — which is what a memory-bound workload looks like: more batch means more
+attention traffic, so halving the element width matters more. Note this contradicts
+the +4% measured in `perf/half-precision`, which was taken at 1024 tokens; the
+benefit is geometry-dependent and grows with token count.
+
+**f32 does not OOM at this geometry.** `perf/half-precision` reports f32 OOMing
+outright on 32 GB at 4×40×40 while half precision fits in 13.8 GB. It does not
+reproduce: f32 completed at accum 8, 16 and 32, sitting at ~24 GB of 32 GB at the
+largest. This also resolves the tension with round 1, which ran f32 at exactly this
+geometry to produce the 2.04 baseline. bf16 therefore does *not* buy batch headroom
+here, and any argument for it resting on the memory ceiling is wrong.
+
+So the honest position: CUDA + bf16 + a larger batch takes an ~18-day run to
+**~7.4 days** (~$87 at $0.49/h against round 1's $215). Real, banked, and still not
+an afternoon — the remaining factor has to come from attention.
+
+## 5. What not to re-attempt
 
 * **Host-stall removal in the trainer.** Measured at 0.5% of wall clock. Done, and
   the remaining time is arithmetic.
 * **Wider attention tiles to get a batch dimension.** The tape, not the transient
   peak, is the limit. Needs a fused softmax with recompute-on-backward.
 * **f16 for training.** It hard-fails on real data, and disabling gradient clipping
-  does not save it.
+  does not save it. `train` now refuses it.
+* **bf16 for batch headroom.** f32 does not OOM at production geometry; take bf16
+  for throughput, which is real and grows with batch.
 * **Batching CFG cond+uncond in the teacher pass.** Measured regression.
 * **Micro-optimising the teacher loop for GPU utilisation.** It is at 92% of TGP.
 
-## 5. Still unmeasured
+## 6. Still unmeasured
 
-* **wgpu vs CUDA at identical geometry.** Blocked: the rented container was created
-  with `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, so the only Vulkan ICD was
-  llvmpipe and wgpu would have benchmarked a CPU rasterizer. Indicative only:
-  CUDA fwd+bwd 154.73 ms/sample against wgpu's 473.32 ms/sample at the same spec and
-  sample count, but a different cache — **3.06×, not measured**.
-* **Whether bf16 teacher targets degrade the student.** The 6.9% mean deviation from
+* **A same-box wgpu baseline.** Section 4 compares CUDA against round 1's *recorded*
+  2.04 samples/s — same GPU model, same geometry, different machine and cache. Two
+  attempts to measure both arms on one box failed the same way: every `nvidia/cuda`
+  image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility`, Vast does not let the
+  instance env override it, so the only Vulkan ICD is llvmpipe and wgpu silently
+  runs on the CPU (GPU at 0%, 5.7 W). Needs a base image that requests graphics
+  capability.
+* **Whether bf16 *teacher* targets degrade the student.** (Distinct from trainer
+  bf16 in section 4, which is measured and safe.) The 6.9% mean deviation from
   fp32 targets is not a rounding artifact and nothing here shows it is harmless.
   Build two small caches, train a short run on each, compare against the
   trivial-predictor floor in `parity_baseline.py` before committing a large cache.
