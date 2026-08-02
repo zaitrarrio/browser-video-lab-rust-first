@@ -1,0 +1,114 @@
+# Validation round 2 — spend the compute
+
+Round 1 ([`VALIDATION-ROUND-1.md`](VALIDATION-ROUND-1.md)) closed the loop and
+found the student undertrained rather than broken: held-out parity cleared the
+trivial floor and improved with batching, but the sampled latent had no spatial
+structure and the student under-predicted velocity magnitude by ~35% uniformly
+across σ. Its first recommendation was blunt — *spend the compute; everything
+else is an optimization of that*. This round does exactly that, on Kaggle's free
+GPU rather than a rented one.
+
+## What changed from round 1
+
+| | round 1 | round 2 |
+|---|---|---|
+| clips | 8 | **128** |
+| shards | 1536 (8 × 192) | **2560** (128 × 20) |
+| question | can it memorize 8 clips? | can it learn the field? |
+| batch | 1, then 8 | **8** throughout |
+| hardware | rented RTX 5090, ~40 min | Kaggle free GPU, 11 h/chunk |
+
+The clip count is what matters. Round 1 was an overfit probe by design — dense
+(noise, σ) coverage over a handful of clips, which can only distinguish "learned
+something" from "learned nothing". 128 clips is still nowhere near a real
+distillation corpus, but it is enough that memorization stops being the cheap
+explanation for a good parity number.
+
+Geometry is unchanged at 320×320 (`[1,16,4,40,40]`, 1600 tokens post-patchify),
+for the reason round 1 established: Wan2.1-1.3B is itself incoherent below 320,
+so a smaller reference is not worth matching.
+
+## The cache
+
+`zaitrarriocollier/browser-video-student-chunk-teacher-cache` **v3** — 2560
+shards, 7.5 GB, `scheduler: wan21-flow-shift3-cfg5`, `validate-cache` clean.
+Real Wan latents, flow-matching noising warped by `shift=3`, CFG-5 guided
+velocity targets, no relation grams (see round 1 on why grams cost an order of
+magnitude in draw count).
+
+> **v1 and v2 are not this.** v1 is the original cache: `scheduler: wan21`,
+> legacy `x₀ + σ·ε` noising, 128 shards, and `torch.randn` latents. Training on
+> it reruns the configuration round 1 disproved. If a run ever mounts v1 by
+> accident the manifest's `scheduler` string is how to notice — that is what it
+> is for.
+
+### Uploading it is not trivial
+
+`kaggle datasets version` uploads top-level files individually — `--dir-mode zip`
+only archives *subdirectories* — so 2561 shards go up one at a time and the final
+`CreateDatasetVersion` call **504s at the gateway**. Every byte transfers and no
+version is committed; roughly an hour is lost with no error until the very end.
+
+The fix is to hand Kaggle a single archive: zip the shards and manifest at the
+zip root (`zip -0`, stored — the payload is incompressible float data) and upload
+that one file. Kaggle auto-extracts it into the dataset root, so the mounted
+layout is identical and `restore_teacher_cache` needs no change. Verified with a
+throwaway two-file dataset before committing to the 7.5 GB upload.
+
+## Reading the result
+
+Held-out eval cache: `zaitrarriocollier/browser-video-student-chunk-eval-cache`,
+128 shards, one fresh-seed draw per clip at `shift=1` so σ coverage is uniform
+rather than warped toward high noise.
+
+Trivial-predictor floor on that cache (`task teacher:baseline`):
+
+| trivial predictor | cosine | rel L2 |
+|---|---|---|
+| echo the noisy input | −0.101 | 1.209 |
+| **best-scaled echo (least squares)** | **+0.443** | **0.850** |
+| mean teacher target | +0.213 | 0.977 |
+
+**+0.443 is the floor.** Round 1 finished at +0.584 on 8 clips. A round-2 number
+below the floor means the extra clips bought nothing; a number near round 1's on
+16× the clips would be the more interesting result, since it would mean the
+student is learning the field rather than the clips.
+
+The magnitude ratio matters as much as the cosine: round 1's student predicted
+velocities at 0.63–0.67 of the teacher's norm, and an Euler integrator that
+travels two-thirds of each step cannot reach the data manifold whatever its
+direction accuracy. Watch `pred_norm/teacher_norm` in `video-train eval` output
+alongside the cosine.
+
+## Run configuration
+
+```
+spec       rust/config/validation-320.json   (390M umt5 student, max_tokens 8192)
+backend    cuda (Burn, built in-kernel with --features cuda)
+lr         2e-5        raising it is the one thing not to do — see round 1
+accum      8           one optimizer step per 8 shards
+target     20,000 steps = 160,000 sample-views
+session    11 h, checkpoint every 1,000 steps pushed from inside the kernel
+```
+
+`TARGET_STEPS` is 20,000 rather than the previous default of 200,000: at accum 8
+that default is ~1.6 M sample-views, which against Kaggle's ~30 GPU-h/week runs
+for months. The chunk is resumable, so the target is a decision about when to
+stop and look, not a limit on the run.
+
+## Known unknowns going in
+
+- **The Burn CUDA backend has not been run on Kaggle hardware.** Round 1 used
+  wgpu/Vulkan on a 5090. `cargo check --features cuda` passes and the toolchain
+  dataset proves the build worked before, but P100/T4 execution is untested here.
+  VRAM should fit: model 1.5 GB + grads 1.5 + AdamW 3.1 + accumulator 1.5 +
+  activations ≈ 12 GB against 16.
+- **Throughput is unmeasured on this hardware.** The 5090 managed 2.04 samples/s
+  in f32 with no fused attention; a P100 will be several times slower, and that
+  number decides whether 20,000 steps is one chunk or six.
+- Kaggle exposes no live log for a script kernel, only its state, so a build
+  failure surfaces at the end of the chunk rather than during it.
+
+## Results
+
+_(pending — the first chunk is running.)_
