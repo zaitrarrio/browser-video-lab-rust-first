@@ -33,6 +33,10 @@ on:
         description: "Total steps for the whole run"
         type: string
         default: "200000"
+      accum:
+        description: "Shards summed per optimizer step (effective batch size)"
+        type: string
+        default: "8"
       allow_synthetic_teacher:
         description: "Train on synthetic tensors when no teacher cache exists (plumbing only — produces a running student, never a good one)"
         type: boolean
@@ -97,6 +101,10 @@ jobs:
           # (feature loss → NaN) even with grad-clip. Override via a repo variable
           # only if you change the spec/loss weights and re-tune.
           TRAIN_LR: ${{ vars.TRAIN_LR || '2e-5' }}
+          # Effective batch size. 1 (the trainer's default) is what round 1 found
+          # was holding parity down; 8 is what lifted it. Raise this rather than
+          # TRAIN_LR if the loss looks noisy.
+          TRAIN_ACCUM: ${{ github.event.inputs.accum || vars.TRAIN_ACCUM || '8' }}
           CHUNK_STEPS: ${{ github.event.inputs.chunk_steps || vars.CHUNK_STEPS || '20000' }}
           TARGET_STEPS: ${{ github.event.inputs.target_steps || vars.TARGET_STEPS || '200000' }}
           ALLOW_SYNTHETIC_TEACHER: ${{ github.event.inputs.allow_synthetic_teacher || 'false' }}

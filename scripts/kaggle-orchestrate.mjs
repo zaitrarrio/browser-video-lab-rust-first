@@ -75,6 +75,16 @@ const CONFIG = {
   // trainer's non-finite guard points you back to. 1e-4 diverges: the quadratic
   // feature/Gram loss goes NaN a few hundred steps in, even under grad-clip 1.0.
   lr: Number(env("TRAIN_LR", "2e-5")),
+  // Shards summed per optimizer step. The trainer's own default is 1 — one shard
+  // per step — which round 1 measured as the binding constraint rather than a
+  // detail: at batch 1 the gradient is dominated by whichever single (clip,
+  // sigma) draw the cursor landed on, and held-out parity plateaued just above
+  // the trivial-predictor floor until batching was introduced (0.526 → 0.584 at
+  // an unchanged lr). Accumulation costs wall clock per step, not memory, since
+  // each micro-step's activations are freed before the next. See
+  // docs/VALIDATION-ROUND-1.md. Raising lr to compensate is the one thing not to
+  // do — 1e-4 drove parity *below* the floor.
+  accum: Number(env("TRAIN_ACCUM", "8")),
   log_every: Number(env("LOG_EVERY", "200")),
   // A full resumable checkpoint this often. The cost is one save per interval;
   // the alternative is what an end-of-chunk-only save cost on the first real run,

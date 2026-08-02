@@ -205,6 +205,7 @@ def main():
         f'--target-steps {CONFIG["target_steps"]}',
         f'--max-seconds {budget}',
         f'--lr {CONFIG["lr"]}',
+        f'--accum {CONFIG["accum"]}',
         f'--log-every {CONFIG["log_every"]}',
         f'--ckpt-every {CONFIG["ckpt_every"]}',
     ]
