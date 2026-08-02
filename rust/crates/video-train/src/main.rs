@@ -56,6 +56,12 @@ enum Command {
         /// Shards summed per optimizer step — the effective batch size. 1 keeps
         /// the historical one-shard-per-step behaviour exactly.
         #[arg(long, default_value_t = 1)] accum: usize,
+        /// Print where the chunk's wall clock went (shard-load / upload / fwd+bwd /
+        /// optim / readback). Inserts a device barrier per phase, because a lazy
+        /// backend otherwise attributes GPU time to whichever line drains the
+        /// queue — so a profiled run is slower than the same run without this.
+        /// Use it to find the bottleneck, not to quote throughput.
+        #[arg(long, default_value_t = false)] profile: bool,
     },
     /// Integrate the trained student's velocity field from noise to a clean latent
     /// and write it as safetensors for a VAE decode. This is the step that turns
@@ -95,9 +101,9 @@ fn main() -> Result<()> {
             synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip)?;
             println!("wrote {} synthetic shards to {}", shards * draws_per_clip, output.display());
         }
-        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum } => {
+        Command::Train { spec, cache, output, backend, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum };
+            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile };
             let (losses, state) = match backend.as_str() {
                 "ndarray" => train::<Autodiff<NdArray>>(spec, &cache, &output, &settings, &NdArrayDevice::default())?,
                 "wgpu" => train::<Autodiff<Wgpu>>(spec, &cache, &output, &settings, &WgpuDevice::default())?,

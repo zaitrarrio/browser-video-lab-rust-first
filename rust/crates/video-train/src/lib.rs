@@ -10,10 +10,17 @@ use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{backend::Backend, ElementConversion, Tensor};
+use burn::tensor::{backend::Backend, Tensor};
 use safetensors::{tensor::TensorView, Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::{Path, PathBuf}, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 use video_contract::{validate_cache, StudentSpec, TeacherCacheManifest, TensorShape};
 use video_student::{relation, temporal_difference, BrowserVideoStudent};
 
@@ -51,10 +58,93 @@ pub struct TrainSettings {
     /// supports. Accumulating trades steps for signal at identical memory, since
     /// the activations of each micro-step are freed before the next one runs.
     pub accum: usize,
+    /// Attribute the chunk's wall clock to shard-load / upload / fwd+bwd / optim /
+    /// readback and print the split at chunk end. Off by default because it makes
+    /// the loop synchronous — see `Profiler`.
+    pub profile: bool,
 }
 impl Default for TrainSettings {
     fn default() -> Self {
-        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128, accum: 1 }
+        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128, accum: 1, profile: false }
+    }
+}
+
+/// Where a chunk's wall clock actually went.
+///
+/// This exists because "the trainer reaches 8.8% of the 5090" is unactionable
+/// until you know *which* phase is spending the other 91%, and guessing does not
+/// work here: a wgpu dispatch returns immediately, so the cost of a matmul
+/// surfaces at whatever unrelated line later happens to drain the queue. A
+/// sampling profiler blames the readback; the attribution has to be built into
+/// the loop.
+///
+/// What it found, and the reason to keep it rather than delete it after one use:
+/// the loop was *not* stalling on I/O or on host round trips. At the documented
+/// geometry (RTX 5090, wgpu/Vulkan, 320 samples at accum 8) the split is fwd+bwd
+/// 97.1%, optim 2.5%, shard-load 0.3%, upload 0.1%, readback 0.03%. So the
+/// ~447 ms/sample that is not peak arithmetic is arithmetic anyway — 4.53
+/// TFLOP/sample in 473 ms is ~9.6 effective TFLOPS against ~105 TFLOPS of fp32
+/// FMA peak. The remaining headroom is in the kernels (cubecl's wgpu backend runs
+/// plain f32 with no tensor cores), not in this loop; `--features cuda` is where
+/// to look next. Re-run `--profile` before believing that of any future change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Reading + safetensors-decoding a shard to host f32 (or waiting on the
+    /// prefetch thread that is doing it).
+    ShardLoad,
+    /// Host→device staging of this micro-step's tensors.
+    Upload,
+    /// Model forward, loss construction, backward and gradient accumulation.
+    FwdBwd,
+    /// `optim.step` — AdamW moment update and the parameter write.
+    Optim,
+    /// The one device→host readback per step (losses + hidden stats).
+    Readback,
+    /// Everything else on the step path: metrics.jsonl, checkpoints, bookkeeping.
+    Other,
+}
+const PHASE_COUNT: usize = 6;
+const PHASE_NAMES: [&str; PHASE_COUNT] = ["shard-load", "upload", "fwd+bwd", "optim", "readback", "other"];
+
+/// Cumulative per-phase timer, inert unless `--profile` is set.
+///
+/// `lap` takes a sync closure and calls it *before* stopping the clock. That
+/// barrier is the whole point: wgpu is lazy, so without it `fwd+bwd` would report
+/// the cost of enqueueing commands (microseconds) and every millisecond of actual
+/// GPU work would land in whichever phase later happened to block. The barrier
+/// also serialises the pipeline, so a `--profile` run is a little slower than the
+/// same run without it — profile to find the split, time without it to quote
+/// throughput. The summary says so too, so nobody quotes a profiled number.
+struct Profiler {
+    on: bool,
+    mark: Instant,
+    acc: [Duration; PHASE_COUNT],
+}
+impl Profiler {
+    fn new(on: bool) -> Self { Self { on, mark: Instant::now(), acc: [Duration::ZERO; PHASE_COUNT] } }
+    #[inline]
+    fn lap(&mut self, phase: Phase, sync: impl FnOnce()) {
+        if !self.on { return }
+        sync();
+        let now = Instant::now();
+        self.acc[phase as usize] += now - self.mark;
+        self.mark = now;
+    }
+    /// One line per phase, with the residual folded into `other` so the columns
+    /// sum to the chunk's whole wall clock. A breakdown whose parts do not add up
+    /// is worse than none: it invites optimising a phase that was never the cost.
+    fn report(&self, total: Duration, samples: usize) {
+        if !self.on { return }
+        let mut acc = self.acc;
+        acc[Phase::Other as usize] += total.saturating_sub(self.acc.iter().sum());
+        let n = samples.max(1) as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let pct = |d: Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(1e-9);
+        eprintln!("--- profile: {samples} samples in {:.2}s (barriers are on, so this run is slower than the same run without --profile) ---", total.as_secs_f64());
+        for (i, name) in PHASE_NAMES.iter().enumerate() {
+            eprintln!("  {name:<11} {:>9.1} ms  {:>5.1}%  {:>8.2} ms/sample", ms(acc[i]), pct(acc[i]), ms(acc[i]) / n);
+        }
+        eprintln!("  {:<11} {:>9.1} ms  100.0%  {:>8.2} ms/sample", "TOTAL", ms(total), ms(total) / n);
     }
 }
 
@@ -125,36 +215,143 @@ pub fn load_shard(path: &Path, relation_layers: &[usize]) -> Result<Sample> {
     })
 }
 
-/// Bounded, lazy shard loader. Keeps at most `cap` decoded shards resident and
-/// loads the rest on demand, so RAM stays flat as shard counts grow into the
-/// thousands — the eager `manifest.shards.iter().map(load_shard).collect()` it
-/// replaces did not. Shard selection stays a pure function of the global step
-/// (`(step-1) % len`), so a resumed chunked run draws the identical sequence as
-/// a single run (see `resumed_chunks_match_a_single_run`).
+/// Decoded shards handed out by `ShardCache`. `Arc` rather than `&Sample` because
+/// a shard can be decoded by a prefetch thread and must be shareable between that
+/// thread's handoff slot and the resident window without a second 3 MB copy.
+type Decoded = Arc<Sample>;
+
+/// Shards a decoder thread has finished, keyed by index; the `Condvar` wakes the
+/// trainer when the shard it is blocked on lands. A load failure is carried as a
+/// rendered string because `anyhow::Error` is not `Clone` and the error must
+/// survive being moved off the worker thread.
+type Landed = Arc<(Mutex<HashMap<usize, std::result::Result<Decoded, String>>>, Condvar)>;
+
+/// Bounded, lazy, *prefetching* shard loader. Keeps at most `cap` decoded shards
+/// resident and loads the rest on demand, so RAM stays flat as shard counts grow
+/// into the thousands — the eager `manifest.shards.iter().map(load_shard)` it
+/// replaces did not.
+///
+/// Decoding runs on background threads. On the critical path a shard cost a ~3 MB
+/// file read plus a byte→`Vec<f32>` conversion, single-threaded, `accum` times per
+/// optimizer step, with the GPU idle throughout. `request` enqueues an index for a
+/// worker; `get` takes the finished shard if it is ready and only decodes inline
+/// if it is not. Asking for step N+1's shards before running step N's forward is
+/// what turns that dead time into overlap.
+///
+/// Worth roughly 3% at the documented geometry, and only when the resident window
+/// cannot hold the whole cache — measure with `--profile --shard-cache <n>` before
+/// assuming more. It matters for the shape of run this loader exists for (a cache
+/// far larger than `cap`, where every draw is a real read), not for a 64-shard
+/// synthetic one that goes fully resident after the first epoch.
+///
+/// Shard *selection* is untouched and stays a pure function of (step, micro) — see
+/// `shard_index`. Prefetching changes when a shard is decoded, never which one is
+/// drawn, so a resumed chunked run still reproduces a single run bit for bit
+/// (`resumed_chunks_match_a_single_run`).
 struct ShardCache {
     root: PathBuf,
     shards: Vec<PathBuf>,
     relation_layers: Vec<usize>,
     cap: usize,
-    resident: std::collections::HashMap<usize, Sample>,
+    resident: HashMap<usize, Decoded>,
     order: std::collections::VecDeque<usize>,
+    /// Dropped on `Drop` to close the channel and let the workers exit.
+    tx: Option<mpsc::Sender<usize>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    landed: Landed,
+    /// Indices handed to a worker and not yet collected by `get`. Bounds the
+    /// handoff map (the trainer only ever runs one step ahead) and stops the same
+    /// shard being queued twice.
+    inflight: std::collections::HashSet<usize>,
 }
+
+/// Decoder threads. Four is enough to keep one optimizer step's worth of shards
+/// (`accum`, typically 8) ahead of a step that takes far longer than a decode,
+/// and small enough not to contend with the backend's own worker pool.
+const PREFETCH_THREADS: usize = 4;
+
 impl ShardCache {
     fn new(root: PathBuf, shards: Vec<PathBuf>, relation_layers: Vec<usize>, cap: usize) -> Self {
-        Self { root, shards, relation_layers, cap: cap.max(1), resident: std::collections::HashMap::new(), order: std::collections::VecDeque::new() }
+        let (tx, rx) = mpsc::channel::<usize>();
+        let rx = Arc::new(Mutex::new(rx));
+        let landed: Landed = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+        let workers = (0..PREFETCH_THREADS)
+            .map(|_| {
+                let (rx, landed) = (rx.clone(), landed.clone());
+                let (root, shards, layers) = (root.clone(), shards.clone(), relation_layers.clone());
+                std::thread::spawn(move || loop {
+                    // Lock only to take the next index: holding it across the
+                    // decode would serialise the pool back to one thread.
+                    let Ok(idx) = ({ let g = rx.lock().unwrap_or_else(|p| p.into_inner()); g.recv() }) else { return };
+                    let done = load_shard(&root.join(&shards[idx]), &layers).map(Arc::new).map_err(|e| format!("{e:#}"));
+                    let (lock, cv) = &*landed;
+                    lock.lock().unwrap_or_else(|p| p.into_inner()).insert(idx, done);
+                    cv.notify_all();
+                })
+            })
+            .collect();
+        Self {
+            root, shards, relation_layers, cap: cap.max(1),
+            resident: HashMap::new(), order: std::collections::VecDeque::new(),
+            tx: Some(tx), workers, landed, inflight: std::collections::HashSet::new(),
+        }
     }
     fn len(&self) -> usize { self.shards.len() }
-    fn get(&mut self, idx: usize) -> Result<&Sample> {
-        if !self.resident.contains_key(&idx) {
-            let s = load_shard(&self.root.join(&self.shards[idx]), &self.relation_layers)?;
-            while self.order.len() >= self.cap {
-                match self.order.pop_front() { Some(old) => { self.resident.remove(&old); } None => break }
-            }
-            self.resident.insert(idx, s);
-            self.order.push_back(idx);
+
+    /// Ask a worker to decode `idx` in the background. Idempotent and free to call
+    /// for an index that is already resident or already queued.
+    fn request(&mut self, idx: usize) {
+        if idx >= self.shards.len() || self.resident.contains_key(&idx) || !self.inflight.insert(idx) { return }
+        if let Some(tx) = &self.tx {
+            // A dead pool is not fatal: `get` still decodes inline, just without
+            // the overlap. Un-mark so the inline path is taken.
+            if tx.send(idx).is_err() { self.inflight.remove(&idx); }
         }
-        Ok(self.resident.get(&idx).expect("just inserted"))
     }
+
+    fn get(&mut self, idx: usize) -> Result<Decoded> {
+        if let Some(s) = self.resident.get(&idx) { return Ok(s.clone()) }
+        let sample = if self.inflight.remove(&idx) {
+            // Requested earlier: block until the worker publishes it rather than
+            // decoding a second copy. If the prefetch was issued far enough ahead
+            // this returns immediately.
+            let (lock, cv) = &*self.landed;
+            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = done.remove(&idx);
+            while slot.is_none() {
+                done = cv.wait(done).unwrap_or_else(|p| p.into_inner());
+                slot = done.remove(&idx);
+            }
+            slot.expect("loop exits only with a value").map_err(|e| anyhow::anyhow!(e))?
+        } else {
+            Arc::new(load_shard(&self.root.join(&self.shards[idx]), &self.relation_layers)?)
+        };
+        while self.order.len() >= self.cap {
+            match self.order.pop_front() { Some(old) => { self.resident.remove(&old); } None => break }
+        }
+        self.resident.insert(idx, sample.clone());
+        self.order.push_back(idx);
+        Ok(sample)
+    }
+}
+impl Drop for ShardCache {
+    fn drop(&mut self) {
+        // Close the channel first, then join: a worker blocked in `recv` returns
+        // on disconnect, and one mid-decode finishes its 3 MB shard and exits.
+        // Detaching instead would leak a thread per `train` call, which the test
+        // suite (many `train`s in one process) would accumulate.
+        self.tx.take();
+        for h in self.workers.drain(..) { let _ = h.join(); }
+    }
+}
+
+/// Which shard micro-step `micro` of global step `step` draws.
+///
+/// Pulled out of the loop so the prefetcher and the trainer cannot drift: the draw
+/// order is load-bearing (a resumed chunk must reproduce a single run exactly),
+/// and "the prefetcher guesses the next index" is precisely how that breaks.
+fn shard_index(step: usize, micro: usize, accum: usize, num_shards: usize) -> usize {
+    ((step - 1) * accum + micro) % num_shards
 }
 
 pub(crate) fn t3<B: Backend>(x: &(Vec<f32>, [usize; 3]), device: &B::Device) -> Tensor<B, 3> {
@@ -173,6 +370,42 @@ fn linspace_idx(len: usize, pairs: usize) -> Vec<usize> {
 }
 
 pub struct StepMetrics { pub output: f32, pub temporal: f32, pub feature: f32, pub total: f32 }
+
+/// Best-effort: which hidden layer first carries a non-finite value, by replaying
+/// the step's micro-batch through the *inference* model.
+///
+/// The losses are now read back once per optimizer step instead of three times per
+/// micro-step, which is what removed 24 queue drains from the hot path — but it
+/// also means "this step is non-finite" is only known after `hidden` has been
+/// dropped. Replaying is what keeps the diagnostic exact anyway: `model` has not
+/// been stepped yet (the update is skipped precisely because the loss was
+/// non-finite), there is no dropout or other sampling in the student, so the
+/// replay reproduces the same hidden states the loss saw. The cost — a second
+/// forward pass — is paid only on the rare non-finite path, never on a healthy
+/// step, which is the same trade the previous inline probe made.
+fn first_non_finite_layer<B: AutodiffBackend>(
+    model: &BrowserVideoStudent<B>,
+    shards: &mut ShardCache,
+    step: usize,
+    accum: usize,
+    device: &B::Device,
+) -> Option<usize> {
+    type Inner<B> = <B as AutodiffBackend>::InnerBackend;
+    let infer = model.valid();
+    let n = shards.len();
+    for micro in 0..accum {
+        let Ok(sample) = shards.get(shard_index(step, micro, accum, n)) else { continue };
+        let noisy = t5::<Inner<B>>(&sample.noisy, device);
+        let timestep = Tensor::<Inner<B>, 1>::from_floats(sample.timestep.as_slice(), device).reshape([sample.timestep.len(), 1]);
+        let prompt = t3::<Inner<B>>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
+        let (_, hidden) = infer.forward(noisy, timestep, prompt);
+        let bad = hidden.iter().position(|h| {
+            h.clone().to_data().to_vec::<f32>().map(|v| v.iter().any(|x| !x.is_finite())).unwrap_or(false)
+        });
+        if bad.is_some() { return bad }
+    }
+    None
+}
 
 /// Write a *complete*, resumable checkpoint: weights, AdamW moments and run state.
 ///
@@ -290,39 +523,66 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
     const MAX_CONSECUTIVE_NON_FINITE: u32 = 5;
     let mut consecutive_non_finite: u32 = 0;
     let accum = s.accum.max(1);
+    // Nothing has been requested yet, so step 1 would block on all `accum` decodes
+    // back to back. Prime the pool before the clock-sensitive part of the loop.
+    for micro in 0..accum { shards.request(shard_index(start_step + 1, micro, accum, num_shards)); }
+    let mut prof = Profiler::new(s.profile);
+    let sync = || { let _ = B::sync(device); };
     for i in 1..=chunk {
         let step = start_step + i;
-        // Tests the actual theory (unbounded residual-stream growth from the
-        // time/text conditioning injected before block 0, raised after the
-        // step-349 investigation) directly, as a trend, rather than waiting to
-        // see whether it eventually crashes. Read before backward() — this is
-        // the forward-pass hidden state, unaffected by whether this step's
-        // update later gets applied or skipped.
-        let hidden_stats = |h: &Tensor<B, 3>| -> (f32, f32) {
-            match h.clone().to_data().to_vec::<f32>() {
-                Ok(v) => {
-                    let sumsq: f32 = v.iter().map(|x| x * x).sum();
-                    let maxabs = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-                    (sumsq.sqrt(), maxabs)
-                }
-                Err(_) => (f32::NAN, f32::NAN),
-            }
+        // Hidden-state stats test the actual theory (unbounded residual-stream
+        // growth from the time/text conditioning injected before block 0, raised
+        // after the step-349 investigation) directly, as a trend, rather than
+        // waiting to see whether it eventually crashes. A trend does not need
+        // every point: computing them only on logged steps keeps them out of the
+        // hot path entirely, and they are recorded as `null` elsewhere.
+        //
+        // They are also computed *on device* now. The previous version pulled two
+        // [1,1600,1152] tensors back to the host — 14.7 MB per step across the PCIe
+        // link, two more queue drains, then a serial 3.7M-float reduction on one
+        // CPU thread — to produce four numbers. The reduction is exactly what a GPU
+        // is for; only the four scalars need to cross. The norms shift in the last
+        // few digits as a result (a GPU tree reduction sums 1.8M f32 squares more
+        // accurately than the host's sequential loop did, not less); the max is
+        // bit-identical. These are a trend line, not a contract.
+        let want_stats = i % s.log_every.max(1) == 0 || i == 1;
+        let hidden_stats = |h: &Tensor<B, 3>| -> Tensor<B, 1> {
+            // Detached: this is a measurement, and letting it into the autodiff
+            // graph would add a backward path that contributes nothing.
+            let x = h.clone().detach();
+            Tensor::cat(vec![x.clone().powf_scalar(2.0).sum().sqrt(), x.abs().max()], 0)
         };
         let (mut layer0_norm, mut layer0_max) = (f32::NAN, f32::NAN);
         let (mut layerlast_norm, mut layerlast_max) = (f32::NAN, f32::NAN);
         let mut accumulator = GradientsAccumulator::new();
         let mut m = StepMetrics { output: 0.0, temporal: 0.0, feature: 0.0, total: 0.0 };
-        let mut non_finite_layer: Option<Option<usize>> = None;
+        // Per-component losses summed *on device* across micro-steps. Reading each
+        // of `output`/`temporal`/`feature` per micro-step meant 3·accum blocking
+        // device→host round trips per optimizer step (24 at accum=8), each of which
+        // drains the whole wgpu queue and idles the GPU while the host catches up.
+        // The sum is a scalar op; only the total needs to be a number on the host.
+        // The step's loss is unchanged to the last bit — `metrics.jsonl` from before
+        // and after this change match exactly — so this is purely about when the
+        // host is allowed to block, not about what is computed.
+        let mut totals: Option<Tensor<B, 1>> = None;
+        let mut stats: Option<Tensor<B, 1>> = None;
+
+        // Decode the *next* step's shards while this step's forward/backward has
+        // the GPU. Issued before the micro loop so the workers get a full step of
+        // compute to hide behind.
+        if i < chunk { for micro in 0..accum { shards.request(shard_index(step + 1, micro, accum, num_shards)); } }
 
         for micro in 0..accum {
             // Shard selection stays a pure function of (step, micro), so a resumed
             // chunked run still draws the identical sequence — with accum=1 this
             // is exactly the original `(step-1) % len`.
-            let sample = shards.get(((step - 1) * accum + micro) % num_shards)?;
+            let sample = shards.get(shard_index(step, micro, accum, num_shards))?;
+            prof.lap(Phase::ShardLoad, sync);
             let noisy = t5::<B>(&sample.noisy, device);
             let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device).reshape([sample.timestep.len(), 1]);
             let prompt = t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
             let teacher = t5::<B>(&sample.teacher_pred, device);
+            prof.lap(Phase::Upload, sync);
 
             let (pred, hidden) = model.forward(noisy, timestep, prompt);
             let output = mse(pred.clone(), teacher.clone());
@@ -343,30 +603,29 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
                 + feature.clone().mul_scalar(s.w_feature))
                 .div_scalar(accum as f32);
 
-            if micro == 0 {
-                (layer0_norm, layer0_max) = hidden_stats(&hidden[0]);
-                (layerlast_norm, layerlast_max) = hidden_stats(&hidden[hidden.len() - 1]);
+            // Read before backward(): this is the forward-pass hidden state,
+            // unaffected by whether this step's update later gets applied or skipped.
+            if want_stats && micro == 0 {
+                stats = Some(Tensor::cat(vec![hidden_stats(&hidden[0]), hidden_stats(&hidden[hidden.len() - 1])], 0));
             }
+            let triple = Tensor::cat(vec![output.detach(), temporal.detach(), feature.detach()], 0);
+            totals = Some(match totals { Some(t) => t + triple, None => triple });
 
             accumulator.accumulate(&model, GradientsParams::from_grads(loss.backward(), &model));
-
-            let (o, t, f) = (
-                output.into_scalar().elem::<f32>(),
-                temporal.into_scalar().elem::<f32>(),
-                feature.into_scalar().elem::<f32>(),
-            );
-            // Which micro-step blew up, and in which layer, has to be captured
-            // here: `hidden` does not outlive this iteration, and with accum > 1
-            // "the step went non-finite" no longer identifies a single sample.
-            if !(o * s.w_output + t * s.w_temporal + f * s.w_feature).is_finite() && non_finite_layer.is_none() {
-                non_finite_layer = Some(hidden.iter().position(|h| {
-                    h.clone().to_data().to_vec::<f32>().map(|v| v.iter().any(|x| !x.is_finite())).unwrap_or(false)
-                }));
-            }
-            m.output += o / accum as f32;
-            m.temporal += t / accum as f32;
-            m.feature += f / accum as f32;
+            prof.lap(Phase::FwdBwd, sync);
         }
+
+        // The single device→host sync of the step: three summed losses, plus four
+        // hidden-state scalars on logged steps, in one 7-float transfer.
+        let mut probe = totals.expect("accum >= 1 always runs one micro-step");
+        if let Some(st) = stats { probe = Tensor::cat(vec![probe, st], 0) }
+        let v = probe.into_data().to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("loss readback failed at step {step}: {e:?}"))?;
+        prof.lap(Phase::Readback, sync);
+        // Micro-step means, as before — the sum happened on device rather than in
+        // the `m.output += o / accum` running total, so the value is unchanged.
+        (m.output, m.temporal, m.feature) = (v[0] / accum as f32, v[1] / accum as f32, v[2] / accum as f32);
+        if want_stats { [layer0_norm, layer0_max, layerlast_norm, layerlast_max] = [v[3], v[4], v[5], v[6]] }
         m.total = m.output * s.w_output + m.temporal * s.w_temporal + m.feature * s.w_feature;
 
         // Non-finite is decided before the update, exactly as before: skipping the
@@ -375,6 +634,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         if m.total.is_finite() {
             model = optim.step(s.lr, model, accumulator.grads());
         }
+        prof.lap(Phase::Optim, sync);
         history.push(m.total);
         state.steps_done = step;
         state.last_loss = m.total;
@@ -384,7 +644,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             "layer0_norm": layer0_norm, "layer0_max": layer0_max,
             "layerlast_norm": layerlast_norm, "layerlast_max": layerlast_max,
         });
-        if i % s.log_every.max(1) == 0 || i == 1 {
+        if want_stats {
             println!("{line}");
         }
 
@@ -408,9 +668,10 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             consecutive_non_finite += 1;
             // Best-effort: identify which hidden-state layer first contains a
             // non-finite value, so a recurring failure points at a specific layer
-            // instead of just "step N, feature went NaN" again. Read-back cost is
-            // only paid on the (rare) non-finite path, never on a healthy step.
-            let bad_layer = non_finite_layer.flatten();
+            // instead of just "step N, feature went NaN" again. Replaying the
+            // forward pass here (rather than probing inline every micro-step) keeps
+            // the cost on the rare path only — see `first_non_finite_layer`.
+            let bad_layer = first_non_finite_layer(&model, &mut shards, step, accum, device);
             let diag = serde_json::json!({
                 "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature,
                 "total": serde_json::Value::Null, "non_finite_layer": bad_layer,
@@ -442,6 +703,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
                 bad_layer.map(|l| l.to_string()).unwrap_or_else(|| "none found (all hidden layers finite — non-finite value entered elsewhere)".into()),
                 step - 1, out.display()
             );
+            prof.lap(Phase::Other, sync);
             continue;
         }
         consecutive_non_finite = 0;
@@ -455,12 +717,14 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             last_saved = step;
             eprintln!("checkpoint written at step {step}");
         }
+        prof.lap(Phase::Other, sync);
         if s.max_seconds > 0 && began.elapsed().as_secs() >= s.max_seconds {
             stopped_by = "max-seconds";
             eprintln!("wall-clock budget of {}s reached at step {step} — checkpointing", s.max_seconds);
             break;
         }
     }
+    prof.report(began.elapsed(), history.len() * accum);
 
     state.chunks += 1;
     state.train_seconds += began.elapsed().as_secs_f64();
@@ -679,6 +943,72 @@ mod tests {
         // relation gram proves the internal sequence length is the patchified 8,
         // not the 32 an unpatchified flatten would produce.
         assert_eq!(relation(hidden[0].clone()).dims(), [1, 8, 8]);
+    }
+
+    // Hidden-state stats moved off the hot path: they are a trend line for
+    // residual-stream growth, so they are computed on the steps that get logged
+    // and recorded as `null` on the rest. Two things must hold for that to be an
+    // optimization rather than a regression — the trend is still there on logged
+    // steps, and `metrics.jsonl` is still parseable on every step (serde_json
+    // renders NaN as `null`, which a reader must not confuse with a malformed
+    // line). A file that stops parsing is worse than a slow one.
+    #[test]
+    fn hidden_stats_are_recorded_on_logged_steps_and_null_elsewhere() {
+        let _seed = seed_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let out = dir.path().join("run");
+        let spec = tiny_spec();
+        synth_cache(&spec, &cache, 2, 2, 4, 4, 4, 12, 2, 3, 1).unwrap();
+        let settings = TrainSettings { steps: 20, lr: 1e-2, log_every: 5, ..Default::default() };
+        train::<Autodiff<NdArray>>(spec, &cache, &out, &settings, &NdArrayDevice::default()).unwrap();
+
+        let text = fs::read_to_string(out.join("metrics.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("metrics.jsonl line is not JSON ({e}): {l}")))
+            .collect();
+        assert_eq!(rows.len(), 20, "every step must still be recorded");
+        // log_every=5 over 20 steps logs 1, 5, 10, 15, 20.
+        let with_stats: Vec<usize> = rows.iter()
+            .filter(|r| !r["layer0_norm"].is_null())
+            .map(|r| r["step"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(with_stats, vec![1, 5, 10, 15, 20], "stats must land on exactly the logged steps");
+        for r in &rows {
+            assert!(r["total"].as_f64().is_some(), "loss must be a number on every step: {r}");
+            let logged = !r["layer0_norm"].is_null();
+            for k in ["layer0_max", "layerlast_norm", "layerlast_max"] {
+                assert_eq!(!r[k].is_null(), logged, "stat {k} disagrees with layer0_norm on {r}");
+            }
+        }
+        // The point of the stats: a norm the reader can compare across steps.
+        let first = rows.iter().find(|r| !r["layer0_norm"].is_null()).unwrap();
+        assert!(first["layer0_norm"].as_f64().unwrap() > 0.0, "on-device norm came back as zero: {first}");
+    }
+
+    // Prefetching must change *when* a shard is decoded, never what comes back.
+    // A worker thread that raced with eviction, or a handoff that returned the
+    // wrong index, would corrupt training silently — the loss would still fall,
+    // just on the wrong data. Compare a prefetched draw against an inline one.
+    #[test]
+    fn prefetched_shards_match_inline_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        synth_cache(&tiny_spec(), &cache, 3, 2, 4, 4, 4, 12, 2, 7, 2).unwrap();
+        let manifest = validate_cache(&cache).unwrap();
+        let mut sc = ShardCache::new(cache.clone(), manifest.shards.clone(), manifest.hidden_relation_layers.clone(), 2);
+        // Queue everything up front, then draw in a different order than requested
+        // and past the resident cap, so hits, evictions and re-requests all occur.
+        for idx in 0..sc.len() { sc.request(idx); }
+        for idx in [5usize, 0, 3, 3, 1, 5] {
+            let direct = load_shard(&cache.join(&manifest.shards[idx]), &manifest.hidden_relation_layers).unwrap();
+            let got = sc.get(idx).unwrap();
+            assert_eq!(got.noisy.1, direct.noisy.1, "shard {idx} shape differs after prefetch");
+            assert_eq!(got.noisy.0, direct.noisy.0, "shard {idx} decoded differently after prefetch");
+            assert_eq!(got.teacher_pred.0, direct.teacher_pred.0, "shard {idx} teacher pred differs after prefetch");
+        }
+        assert!(sc.resident.len() <= 2, "cap must survive prefetching, got {} resident", sc.resident.len());
     }
 
     // Chunked training is the whole basis of the free-GPU pipeline: a 12h-capped
