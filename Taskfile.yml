@@ -6,6 +6,7 @@ vars:
   DISTILL_CONFIG: '{{default "python/longlive_distill/configs/browser-384m.yaml" .DISTILL_CONFIG}}'
   TRAIN_SPEC: '{{default "rust/config/browser-390m-umt5.json" .TRAIN_SPEC}}'
   TRAIN_OUT: '{{default "artifacts/longlive-browser-burn" .TRAIN_OUT}}'
+  SAMPLE_OUT: '{{default "artifacts/sample.safetensors" .SAMPLE_OUT}}'
   # Quantization reads the trained Burn record; its spec must match the record.
   QUANT_SPEC: '{{default "rust/config/browser-390m-umt5.json" .QUANT_SPEC}}'
   CHECKPOINT: '{{default "artifacts/longlive-browser-burn/student.mpk" .CHECKPOINT}}'
@@ -161,6 +162,33 @@ tasks:
           --spec {{.TRAIN_SPEC}} --cache {{.CACHE}} --output {{.TRAIN_OUT}} \
           --steps {{.CHUNK_STEPS}} --target-steps {{.TARGET_STEPS}} --max-seconds {{.MAX_SECONDS}} $resume {{.CLI_ARGS}}
       - cat {{.TRAIN_OUT}}/state.json
+  rust:sample:
+    desc: 'Integrate the trained student from noise to a latent (WEIGHTS, PROMPT=a cache shard). The step that makes "did it learn" something you can look at.'
+    requires: {vars: [WEIGHTS]}
+    cmds:
+      - cargo run --release --manifest-path rust/Cargo.toml -p video-train -- sample --spec {{.TRAIN_SPEC}} --weights {{.WEIGHTS}} --output {{.SAMPLE_OUT}} {{.CLI_ARGS}}
+  rust:eval:
+    desc: 'Teacher parity (cosine / rel L2) for WEIGHTS over CACHE. Read it against `teacher:baseline` — never on its own.'
+    requires: {vars: [WEIGHTS, CACHE]}
+    cmds:
+      - cargo run --release --manifest-path rust/Cargo.toml -p video-train -- eval --spec {{.TRAIN_SPEC}} --weights {{.WEIGHTS}} --cache {{.CACHE}} {{.CLI_ARGS}}
+  teacher:baseline:
+    desc: 'Trivial-predictor floor for CACHE. A flow-matching target correlates with the model input, so "echo the input" already scores ~0.45 cosine.'
+    requires: {vars: [CACHE]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.parity_baseline --cache {{.CACHE}}']
+    env: {PYTHONPATH: python}
+  teacher:latents:
+    desc: 'Build dataset items with REAL Wan latents (needs a CUDA GPU). Replaces make_dataset''s torch.randn stand-ins, which cannot teach coherent video.'
+    deps: [setup:wan]
+    requires: {vars: [CAPTIONS]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.make_wan_dataset --captions {{.CAPTIONS}} --output data/wan-latents --reference-dir artifacts/reference {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
+  teacher:decode:
+    desc: 'Decode a latent (sample or dataset item) to MP4 with the Wan VAE. Set LATENTS.'
+    deps: [setup:wan]
+    requires: {vars: [LATENTS]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.decode_latents --latents {{.LATENTS}} --output artifacts/decoded.mp4 {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
   kaggle:dry-run:
     desc: Render the Kaggle training kernel and print its metadata without pushing
     cmds: [node scripts/kaggle-orchestrate.mjs --dry-run]

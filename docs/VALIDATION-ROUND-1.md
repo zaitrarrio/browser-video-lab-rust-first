@@ -114,4 +114,115 @@ having learned nothing at all.
 
 ## Results
 
-_(filled in below once the run completed — see "Outcome".)_
+### The loop closes
+
+Every stage ran on real data, end to end, for the first time:
+
+```
+8 captions ─▶ Wan2.1 pipeline ─▶ real latents [1,16,4,40,40] + reference MP4s
+          ─▶ 1536 CFG-guided flow-matching shards (4.3 GB, validate-cache OK)
+          ─▶ Burn/WGPU student, 383M params, on the 5090
+          ─▶ video-train sample ─▶ latents ─▶ Wan VAE ─▶ MP4
+```
+
+No PyTorch in the middle two stages, and no synthetic stand-in anywhere. The
+teacher-cache contract survived contact with a real teacher: `validate-cache`
+passed on all 1536 shards, and the patchified student's token count (1600) lined
+up with the Wan teacher's without adjustment.
+
+### Teacher parity
+
+Held-out shards (fresh-seed draws of the same 8 clips, never trained on), scored
+against the trivial floor:
+
+| checkpoint | batch | lr | cosine | rel L2 |
+|---|---|---|---|---|
+| *trivial floor (best-scaled echo)* | — | — | *+0.453* | *0.840* |
+| step 1000 | 1 | 5e-5 | +0.460 | 0.918 |
+| step 2000 | 1 | 5e-5 | +0.526 | 0.850 |
+| step 2400 | 8 | **1e-4** | **+0.399** | **1.060** |
+| step 2000 + 400×8 | 8 | 2e-5 | **+0.584** | **0.804** |
+
+The student clears the floor and improves monotonically — **except** at lr 1e-4,
+where it fell *below* the floor while the deepest hidden-state norm inflated from
+10.3k to 13.9k. That reproduces, on a real cache, the instability behind the
+`step-349` investigation and confirms the lr default of 2e-5 was the right call.
+Batching is a real win at a safe lr; batching *plus* a raised lr is not.
+
+### Sampling
+
+The sampler integrates, and produces a latent with plausible statistics rather
+than noise or a collapse (std 0.84 against the teacher clips' 1.18). Decoded,
+it is a smooth colour field in roughly the right palette with **no spatial
+structure** — see `artifacts/validation-round-1/compare-b8.png`, student left,
+nearest teacher clip right.
+
+Two measurements explain why, and both point the same way:
+
+- **The student under-predicts velocity magnitude by ~35%**, uniformly across
+  σ (`|pred|/|teacher|` = 0.63–0.67 in every band). An Euler integrator that
+  travels 65% of the required distance at every step cannot arrive: the sampled
+  latent's std/teacher ratio, 0.71, is what that shortfall compounds to. This is
+  ordinary regression shrinkage from an undertrained model, not a convention bug.
+- **Parity is flat across σ** (0.53 at σ<0.2 rising to 0.60 at σ>0.8). The
+  student has learned a σ-averaged approximation of the field rather than a
+  σ-specific one. It is not catastrophically worse at low σ, which would have
+  indicated broken conditioning; it is uniformly mediocre, which indicates
+  undertraining.
+
+Prompt conditioning does not yet steer the sample: conditioned on clip 0, the
+result is nearest to clip 4 (+0.32) and only +0.16 to clip 0, though the spread
+across clips (0.51) shows the model has learned *some* clip-specific structure.
+
+### Throughput — the number that sizes everything else
+
+**2.04 samples/s** (400 steps × batch 8 in 1567 s), f32, Burn/WGPU, no fused
+attention, at 1600 tokens on an RTX 5090. A conventional DiT distillation
+schedule — say 100k steps at batch 32, 3.2M sample-views — is therefore **~18
+GPU-days on this box**, about $215 at $0.49/h. That is the real cost of the
+deliverable, and it is a budget question rather than a correctness one.
+
+The obvious levers, none of them started: bf16 (Burn/WGPU runs f32 today), a
+fused attention kernel (the `[1,16,1600,1600]` probability matrix is
+materialized), and the Wan2.2 spatial-16 VAE, which `TEACHER-OPTIONS.md` already
+identifies as a 4× token reduction and would cut attention 16×.
+
+## Outcome
+
+**The architecture is validated structurally and the loop is validated
+functionally end to end. Coherent video was not produced, and this round could
+not have produced it.**
+
+What is now known that was not before:
+
+1. A real teacher cache trains the Rust student. The contract, the patchify
+   geometry, the relation-free loss, the chunked trainer, the record round-trip,
+   the sampler and the decode all work on real Wan2.1 data.
+2. The student learns something real — parity clears the trivial floor and
+   improves with batching — but at 5,200 sample-views it is far short of what a
+   383M diffusion student needs, and the velocity-magnitude shortfall says
+   exactly that.
+3. Three latent bugs that would have invalidated any amount of training are
+   fixed: noise latents, the noising parameterization, and the missing decode.
+4. Two real defects were found and fixed in the trainer: no batching at all
+   (batch was hardcoded to 1), and — reconfirmed — that lr 1e-4 destabilizes this
+   architecture.
+5. The cost of the actual deliverable is now measured, not guessed: ~18 GPU-days
+   on a 5090 for a conventional schedule, before any of the three speed levers.
+
+### What round 2 should test, in order
+
+1. **Spend the compute.** The single highest-information action is a long run at
+   batch ≥ 8 and lr 2e-5 on a larger cache. Everything below is an optimization
+   of that, and none of it should be done first.
+2. **bf16 + fused attention** before, not after, the long run — a 3–5× throughput
+   win changes what is affordable.
+3. **Per-block timestep conditioning.** The student's only σ input is
+   `Linear(1 → width)` added once at the stem, where every DiT in this family
+   uses adaLN-zero modulation in every block. Flat-across-σ parity is consistent
+   with that being a ceiling, though this round cannot separate it from
+   undertraining. Worth an A/B once (2) makes runs cheap.
+4. **Prompt conditioning.** Mean-pooling the caption to one added vector, with no
+   cross-attention, is the weakest link after σ. The clip-selection result says
+   it is not yet steering anything.
+
