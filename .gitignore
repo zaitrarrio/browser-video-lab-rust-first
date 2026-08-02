@@ -42,7 +42,10 @@ public/models/**/manifest.json
 .idea/
 .vscode/
 
-# Build artifact: the orchestrator drops a compiled trainer here when it renders
-# a kernel locally. 52 MB, reproducible from source, and it slipped into a commit
-# once via `git add -A`.
+# `kaggle kernels output` defaults to the current directory, so pulling a failed
+# chunk's log drops the kernel's whole /kaggle/working here: a 1 GB clone in
+# repo/, the trainer binary in bin/, and the run dir. All reproducible, none of
+# it source, and `git add -A` swept bin/ into a commit once already.
 bin/
+repo/
+run/
