@@ -178,7 +178,57 @@ So the honest position: CUDA + bf16 + a larger batch takes an ~18-day run to
 **~7.4 days** (~$87 at $0.49/h against round 1's $215). Real, banked, and still not
 an afternoon — the remaining factor has to come from attention.
 
-## 5. What not to re-attempt
+## 5. Token count is not the lever the O(N²) argument implies
+
+`TEACHER-OPTIONS.md` makes the strongest technical case for Plan C on its VAE:
+Wan2.2-TI2V is `z_dim 48, spatial 16` against Wan2.1's `16, 8`, so the same pixels
+become 4× fewer latent positions, and since attention is O(N²) the table there
+scores it at **1/256** the attention cost. Adopting it is a teacher swap — 5B
+weights, ~44 GB, a new adapter, and `latent_channels 16 → 48` through the spec, the
+contract and the browser decode — so the payoff was measured first, using the
+teacher already in hand: resolution alone sweeps token count against the Wan2.1 VAE,
+and 320×320 at Wan2.2's compression *is* 400 tokens.
+
+Throughput at accum 8 (cuda bf16, 20 steps): 400 → 3.810, 784 → 4.000,
+1600 → 3.077 samples/s, and 3136 OOMs. **4× the tokens costs ~1.24×, and 400 tokens
+is slower than 784.** The profile at the two ends says why: fwd+bwd goes
+146.09 → 637.51 ms/sample for 7.84× the tokens — 4.36×, *sub-linear* — while `optim`
+stays flat at 23.3 → 26.2 ms/sample, being O(parameters) and consuming 13.7% of a
+400-token step against 3.9% of a 3136-token one.
+
+That first pass understates the case, because token reduction's real benefit is the
+batch it buys. Sweeping batch at both geometries under one protocol:
+
+| accum | 400 tokens | 1600 tokens | ratio |
+| --- | --- | --- | --- |
+| 8 | 2.500 | 2.162 | 1.16× |
+| 32 | 5.818 | 4.103 | 1.42× |
+| 64 | 7.619 | 4.741 | 1.61× |
+| 128 | **8.258** | **5.079** | **1.63×** |
+
+**Best against best, 4× fewer tokens is worth 1.63× — not 16×, and not 256×.** The
+O(N²) term is real but is not what the wall clock is made of at this model size: at
+1152 hidden width, attention only overtakes the dense path around N ≈ 1152 tokens,
+and below that the run is bound by parameter math, the optimizer step, and kernel
+launch latency rather than by sequence length.
+
+**Batch is the bigger and cheaper lever.** Raising accum 8 → 128 is worth 2.35× at
+1600 tokens and 3.30× at 400, costs nothing but a flag, and needs no teacher. At
+production geometry accum 128 beats accum 32 by 24% under matched conditions.
+
+So Plan C should not be undertaken as a *performance* measure. Its licence and
+quality arguments stand on their own; its speed argument is 1.63× for a teacher
+swap, against 1.24× available immediately from a flag.
+
+**Where the machine is actually idle.** At 99% reported utilisation the card drew
+313 W of 575 W. Utilisation counts kernel residency, not work: the trainer is
+memory-bandwidth-bound, consistent with `perf/tiled-attention` finding ~14.5 GB of
+~16.1 GB per-sample activations in unfused attention. The spare resource is
+arithmetic, so capability that is compute-dense and memory-light — wider layers,
+per-block adaLN-zero σ conditioning, prompt cross-attention — is close to free here,
+while anything that adds tokens or activations is not.
+
+## 6. What not to re-attempt
 
 * **Host-stall removal in the trainer.** Measured at 0.5% of wall clock. Done, and
   the remaining time is arithmetic.
@@ -188,10 +238,12 @@ an afternoon — the remaining factor has to come from attention.
   does not save it. `train` now refuses it.
 * **bf16 for batch headroom.** f32 does not OOM at production geometry; take bf16
   for throughput, which is real and grows with batch.
+* **The Wan2.2 spatial-16 VAE as a speed lever.** Measured at 1.63×, not the 16-256×
+  the O(N²) argument implies (section 5). Raise `--accum` instead.
 * **Batching CFG cond+uncond in the teacher pass.** Measured regression.
 * **Micro-optimising the teacher loop for GPU utilisation.** It is at 92% of TGP.
 
-## 6. Still unmeasured
+## 7. Still unmeasured
 
 * **A same-box wgpu baseline.** Section 4 compares CUDA against round 1's *recorded*
   2.04 samples/s — same GPU model, same geometry, different machine and cache. Two
@@ -205,6 +257,8 @@ an afternoon — the remaining factor has to come from attention.
   fp32 targets is not a rounding artifact and nothing here shows it is harmless.
   Build two small caches, train a short run on each, compare against the
   trivial-predictor floor in `parity_baseline.py` before committing a large cache.
+* **Whether raising `--accum` past 128 keeps paying.** 128 was the largest tried and
+  had not clearly plateaued at 1600 tokens.
 * **The cache levers at production geometry.** Everything above is at 1024 tokens.
   Gram cost scales with tokens², so `--relation-layers` matters far more at
   2304 tokens than the +0.8% measured here.
