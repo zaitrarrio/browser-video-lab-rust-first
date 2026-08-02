@@ -96,19 +96,77 @@ that default is ~1.6 M sample-views, which against Kaggle's ~30 GPU-h/week runs
 for months. The chunk is resumable, so the target is a decision about when to
 stop and look, not a limit on the run.
 
-## Known unknowns going in
+## Result: Kaggle's free GPU cannot run this trainer
 
-- **The Burn CUDA backend has not been run on Kaggle hardware.** Round 1 used
-  wgpu/Vulkan on a 5090. `cargo check --features cuda` passes and the toolchain
-  dataset proves the build worked before, but P100/T4 execution is untested here.
-  VRAM should fit: model 1.5 GB + grads 1.5 + AdamW 3.1 + accumulator 1.5 +
-  activations ≈ 12 GB against 16.
-- **Throughput is unmeasured on this hardware.** The 5090 managed 2.04 samples/s
-  in f32 with no fused attention; a P100 will be several times slower, and that
-  number decides whether 20,000 steps is one chunk or six.
-- Kaggle exposes no live log for a script kernel, only its state, so a build
-  failure surfaces at the end of the chunk rather than during it.
+Both Burn backends fail on Kaggle, for unrelated reasons, and neither is a
+configuration mistake. The accelerator is a **Tesla P100-PCIE-16GB** (Pascal,
+sm_60, driver 580.159.04).
 
-## Results
+| backend | Kaggle P100 (sm_60) | Vast RTX 5090 (sm_120) |
+|---|---|---|
+| `cuda` | panics every step → loss NaN by step 5 | **works** |
+| `wgpu` | no Vulkan adapter | **works** |
 
-_(pending — the first chunk is running.)_
+**CUDA.** `cubecl-cuda 0.10` panics on every step at `compute/stream.rs:101`:
+
+```
+called `Result::unwrap()` on an `Err` value:
+couldn't find resource for that handle: Memory page 0 doesn't exist
+```
+
+The panics land on a worker thread and are swallowed, so the trainer keeps
+running on garbage; the loss is non-finite from step 1 and the sustained-
+divergence guard stops the chunk at step 5. Nine minutes, no checkpoint.
+
+This is **not** a generic cubecl bug. The identical binary, cache, spec, lr and
+accum ran six clean finite steps on an RTX 5090 (sm_120). The failure is
+specific to Pascal-era hardware.
+
+**wgpu.** No adapter at all:
+
+```
+No possible adapter available for backend.
+NotFound { active_backends: Backends(0x0), requested_backends: Backends(VULKAN),
+           supported_backends: Backends(VULKAN | GL) }
+```
+
+`report_accelerator()` shows why: no `/etc/vulkan/icd.d`, no
+`/usr/share/vulkan/icd.d`, and no `libGLX_nvidia`/`libcuda.so` on the default
+library path. The container was granted the nvidia-container-toolkit's compute
+capabilities without `graphics`, so there is no Vulkan ICD to find and none can
+be installed from inside the kernel — the driver library it would have to point
+at is not mounted.
+
+**Choosing a newer GPU is not available over the API.** `ApiSaveKernelRequest`
+exposes `enable_gpu`, `enable_tpu` and `enable_internet` and nothing else; there
+is no accelerator-type field, so a headless push cannot ask for the T4 (sm_75)
+that would plausibly clear the cubecl failure. TPU is moot — Burn has no TPU
+backend.
+
+### What this costs the plan
+
+`TEACHER-OPTIONS.md` records the assumption that "the free-tier GPU's sm_60
+incompatibility — fatal for PyTorch, irrelevant to Burn" made Kaggle viable for
+the Rust student. That assumption is now falsified: sm_60 is fatal for
+Burn/cubecl too, just by a different mechanism, and the wgpu escape hatch is
+closed by the container image rather than by the GPU.
+
+The free-tier pipeline still works for what it was originally built for — the
+**CPU** teacher-cache job (`cache_chunk.py`), which needs no accelerator. It is
+only the GPU training half that has no home on Kaggle.
+
+### Options, in the order they cost
+
+1. **Set the kernel's accelerator to T4 in the Kaggle UI once**, then re-push
+   over the API and see whether the choice sticks. Requires a manual click and
+   is unverified, but it is the only path that keeps training free.
+2. **Upgrade Burn past 0.21** and hope cubecl's Pascal support improves. The
+   loop is slow — the bug reproduces only on a P100, which means every attempt
+   is a Kaggle round trip — and there is no evidence the fix exists upstream.
+3. **Train on rented GPU.** Round 1 measured ~18 GPU-days for a conventional
+   schedule, about $215 at $0.49/h on the 5090 already in use, before the three
+   speed levers round 1 identified (bf16, fused attention, a spatial-16 VAE).
+
+Everything else is ready and waiting: the cache is on Kaggle at v3, the eval
+cache and its floor are recorded, the trainer batches, and the sampler and decode
+work. Only the hardware is missing.
