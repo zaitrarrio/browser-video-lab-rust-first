@@ -1,4 +1,8 @@
-# Performance round 2 — the trainer is at 11% of the card, and torch is at 40%
+# Performance round 2 — the trainer is far off the card, and one protocol bug
+
+> **Read §6a first.** A measurement-protocol error means the Burn figures in §3,
+> §5 and §6 are too low, and the torch/Burn ratios are overstated. Corrected where
+> a corrected number exists; flagged where one does not.
 
 One measurement session on a rented RTX 5090 (`$0.335/h`, Florida), run alongside
 the overfit probe ([`OVERFIT-PROBE.md`](OVERFIT-PROBE.md)). Six results, in the
@@ -215,8 +219,41 @@ turns the batch ceiling from a research problem into a flag.
 decode; round 1 measured shard-load at 0.2–0.3% of wall clock, so this is not
 material, but it is not zero. AdamW over bf16 parameters matches what Burn does
 but is not what anyone should ship — f32 master weights would cost some
-throughput and memory back. And 10 timed steps after 3 warm-ups is a thinner
-protocol than §3's.
+throughput and memory back.
+
+## 6a. CORRECTION — the Burn side of §3, §5 and §6 is measured too low
+
+The 26,513-step probe run reports **22,013 steps in 9000.4 s of `train_seconds`,
+i.e. 19.567 samples/s** at 640×16 with autotune. §5 benchmarked that same shape at
+**9.025**. The live number is **2.17× higher**, and the live number is the honest
+one — it is a single process, a single `train_seconds` reading, and two and a half
+hours long.
+
+**The protocol bug: the warm-up chunk and the timed chunk are separate
+processes.** `--resume` starts a fresh binary, and cubecl's JIT and autotune caches
+live in-process. So the "discarded warm-up" discarded nothing — every timed chunk
+paid full kernel-compilation and autotune-benchmarking cost inside its own
+measured window. That also explains the size of the effect: 2.17× on the autotune
+arms (tuning benchmarks are expensive) against ~1.37× on the baseline arms (JIT
+only).
+
+What this invalidates:
+
+* **§5's absolute figures.** Autotune's true value is larger than +41.6%, because
+  the autotune arm paid tuning cost that the baseline arm did not. The sign and
+  ordering hold; the magnitudes do not.
+* **§6's Burn column, and therefore every torch/Burn ratio.** At 640×16 the
+  corrected ratio is **58.264 / 19.567 = 2.98×**, not 6.46×. The 1152×24 Burn
+  figure has **not** been re-measured, so the 3.48× there is unquantified until it
+  is — and if the same factor applies it would fall to roughly 1.6×, which would
+  change §8's recommendation materially.
+* **§3's width sweep is least affected** (it ran without autotune, so only JIT
+  warm-up leaked in) but is not clean either.
+
+**Do not quote §5 or §6 until they are re-measured**, either as one long single-
+process run per config, or as a two-point slope across two different step counts
+in fresh processes — `rate = (N₂ − N₁) / (t₂ − t₁)` — which cancels a constant
+per-process startup instead of pretending it was warmed away.
 
 ## 7. What the Rust trainer buys, measured
 
