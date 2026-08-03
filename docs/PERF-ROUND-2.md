@@ -244,11 +244,38 @@ What this invalidates:
   ordering hold; the magnitudes do not.
 * **§6's Burn column, and therefore every torch/Burn ratio.** At 640×16 the
   corrected ratio is **58.264 / 19.567 = 2.98×**, not 6.46×. The 1152×24 Burn
-  figure has **not** been re-measured, so the 3.48× there is unquantified until it
-  is — and if the same factor applies it would fall to roughly 1.6×, which would
-  change §8's recommendation materially.
-* **§3's width sweep is least affected** (it ran without autotune, so only JIT
-  warm-up leaked in) but is not clean either.
+  figure has **not** been re-measured — no long single-process run exists at that
+  shape — so 3.48× is unquantified until one does.
+
+**The leak is additive, not multiplicative**, and estimating it the other way is a
+mistake worth naming because a first draft of this section made it. Startup is a
+roughly fixed per-process cost, so it inflates a *fast* config's measured time by a
+larger fraction than a slow one's. Solving `t = S + N/r` at the one shape where
+both numbers are known:
+
+| | 640×16, autotune |
+| --- | --- |
+| timed chunk actually took | 26.59 s |
+| real work in 30 steps (from the 22,013-step run) | 12.27 s |
+| **leaked startup S** | **14.33 s** |
+
+Carrying that same S to 1152×24, whose timed chunk took 41.42 s, gives ~8.86
+samples/s and a torch/Burn ratio of **≈2.28×**:
+
+| assumption for 1152×24 | torch/Burn |
+| --- | --- |
+| as published | 3.48× |
+| constant *multiplier* (wrong model) | 1.60× |
+| **constant *startup* (defensible)** | **≈2.28×** |
+
+So the honest bracket is **2.3–3.5×**, and on the 3.2M-view schedule that is 4.2
+GPU-days against torch's 1.84 — a difference of about **$19**, not the $36 §8
+quotes.
+
+* **§3's width sweep is affected in a known direction.** It ran without autotune,
+  so only JIT warm-up leaked in and S is smaller — but a fixed S penalises the
+  *fast* rows more than the slow ones, so the sweep **understates** the wide/shallow
+  advantage. The true benefit is larger than 1.72×, not smaller.
 
 **Do not quote §5 or §6 until they are re-measured**, either as one long single-
 process run per config, or as a two-point slope across two different step counts
