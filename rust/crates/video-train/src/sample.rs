@@ -138,22 +138,126 @@ pub fn sample<B: Backend>(a: &SampleArgs, device: &B::Device) -> Result<()> {
         println!("{}", serde_json::json!({"step": i + 1, "sigma": s, "sigma_next": s_next}));
     }
 
-    // Always written as f32 safetensors, whatever the run computed in: the file
-    // is consumed by a VAE decode outside this process, and a half-precision
-    // latent silently changing the output dtype would break that contract.
+    let shape = vec![1, a.spec.latent_channels, a.frames, a.height, a.width];
+    let n = write_latents(latents, shape, &a.output)?;
+    println!("wrote {n} to {}", a.output.display());
+    Ok(())
+}
+
+/// Write a `[1,c,t,h,w]` latent as f32 safetensors under the key `latents`.
+///
+/// Always f32 whatever the run computed in: the file is consumed by a VAE decode
+/// outside this process, and a half-precision latent silently changing the output
+/// dtype would break that contract.
+fn write_latents<B: Backend>(latents: Tensor<B, 5>, shape: Vec<usize>, path: &Path) -> Result<usize> {
     let values: Vec<f32> = crate::read_f32(latents)
         .map_err(|e| anyhow::anyhow!("latent readback failed: {e:?}"))?;
-    let shape = vec![1, a.spec.latent_channels, a.frames, a.height, a.width];
     let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-    if let Some(parent) = a.output.parent() {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     safetensors::serialize_to_file(
         vec![("latents".to_string(), TensorView::new(Dtype::F32, shape, &bytes)?)],
         None,
-        &a.output,
+        path,
     )?;
-    println!("wrote {} to {}", values.len(), a.output.display());
+    Ok(values.len())
+}
+
+pub struct DenoiseArgs {
+    pub spec: StudentSpec,
+    pub weights: PathBuf,
+    pub cache: PathBuf,
+    pub shard: usize,
+    pub output: PathBuf,
+    pub teacher_output: Option<PathBuf>,
+}
+
+/// One-step reconstruction from an **on-manifold** input — the measurement that
+/// separates the two surviving explanations in `docs/VALIDATION-ROUND-4.md`.
+///
+/// That round found a student at 0.84 cosine against a 0.46 floor whose sampled
+/// output has no spatial structure whatever. Two things could produce that, and
+/// they call for opposite work:
+///
+/// * **Off-manifold drift.** Every cache shard is `(1-σ)·x0 + σ·ε` for a *real*
+///   `x0` — a thin tube around the data manifold. Sampling starts at pure noise
+///   and follows the student's own predictions, leaving that tube on the first
+///   step and never returning, so parity *inside* the tube says nothing about
+///   behaviour outside it.
+/// * **No global structure.** The output head is per-token, so a model whose
+///   attention never made the tokens agree would emit locally-plausible,
+///   globally-incoherent patches — and would do so even on a perfect input.
+///
+/// This runs the student on a shard's stored `x_σ`, which is *by construction*
+/// on-manifold, and inverts the same identity `reconstruct_from_shard.py` uses
+/// with the teacher's velocity:
+///
+/// ```text
+/// x0 = x_σ - σ·v
+/// ```
+///
+/// Decode the result. Recognisable clip ⇒ the model is sound and the defect is
+/// the trajectory. Blocky ⇒ the model never learned global structure. The
+/// teacher's reconstruction from the same shard is the control, and
+/// `--teacher-output` writes it through the identical code path so the two files
+/// differ only in whose velocity produced them.
+pub fn denoise<B: Backend>(a: &DenoiseArgs, device: &B::Device) -> Result<()> {
+    a.spec.validate()?;
+    let manifest = validate_cache(&a.cache)?;
+    let name = manifest
+        .shards
+        .get(a.shard)
+        .ok_or_else(|| anyhow::anyhow!("shard {} out of range ({} in cache)", a.shard, manifest.shards.len()))?;
+    let sample = load_shard(&a.cache.join(name), &[])?;
+    let model = load_student::<B>(&a.spec, &a.weights, device)?;
+
+    let sigma = sample.timestep.first().copied().unwrap_or(0.0) / 1000.0;
+    let shape = sample.noisy.1.to_vec();
+    let noisy = crate::t5::<B>(&sample.noisy, device);
+    let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device)
+        .reshape([sample.timestep.len(), 1]);
+    let prompt = crate::t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
+
+    let (v_student, _) = model.forward(noisy.clone(), timestep, prompt);
+    let v_teacher = crate::t5::<B>(&sample.teacher_pred, device);
+
+    let x0_student = noisy.clone() - v_student.clone().mul_scalar(sigma);
+    let x0_teacher = noisy - v_teacher.clone().mul_scalar(sigma);
+
+    // Report both velocities and both reconstructions. The cosine between the two
+    // x0s is the number this command exists for: it says how close the student
+    // gets to the teacher's answer in one step from a point the cache actually
+    // covers, with no integration and no drift in the way.
+    let rd = |t: Tensor<B, 5>| -> Result<Vec<f32>> {
+        crate::read_f32(t).map_err(|e| anyhow::anyhow!("readback: {e:?}"))
+    };
+    let (vs, vt) = (rd(v_student)?, rd(v_teacher)?);
+    let (xs, xt) = (rd(x0_student.clone())?, rd(x0_teacher.clone())?);
+    let cos = |a: &[f32], b: &[f32]| -> f32 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>().sqrt();
+        (dot / (na * nb).max(1e-12)) as f32
+    };
+    let std = |v: &[f32]| -> f32 {
+        let m = v.iter().sum::<f32>() / v.len() as f32;
+        (v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+    };
+    println!("{}", serde_json::json!({
+        "shard": name, "sigma": sigma,
+        "velocity_cosine": cos(&vs, &vt),
+        "x0_cosine": cos(&xs, &xt),
+        "x0_student_std": std(&xs), "x0_teacher_std": std(&xt),
+        "v_student_std": std(&vs), "v_teacher_std": std(&vt),
+    }));
+
+    let n = write_latents(x0_student, shape.clone(), &a.output)?;
+    println!("wrote {n} to {}", a.output.display());
+    if let Some(p) = &a.teacher_output {
+        write_latents(x0_teacher, shape, p)?;
+        println!("wrote teacher control to {}", p.display());
+    }
     Ok(())
 }
 

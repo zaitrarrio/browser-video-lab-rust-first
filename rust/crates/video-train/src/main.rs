@@ -4,7 +4,7 @@ use burn::tensor::{backend::Backend, bf16, f16, DType};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{fs, path::{Path, PathBuf}};
 use video_contract::StudentSpec;
-use video_train::sample::{evaluate, sample, SampleArgs};
+use video_train::sample::{denoise, evaluate, sample, DenoiseArgs, SampleArgs};
 use video_train::{synth_cache, train, TrainSettings, TrainState};
 
 /// Element type every float tensor in the run is stored and computed in.
@@ -312,6 +312,25 @@ enum Command {
         /// Shards to score (0 = all).
         #[arg(long, default_value_t = 0)] limit: usize,
     },
+    /// One-step reconstruction `x0 = x_σ - σ·v` from a cache shard, using the
+    /// student's own velocity. The shard's `x_σ` is on-manifold by construction,
+    /// so decoding the result separates "the model cannot draw" from "the sampler
+    /// drifts off the manifold the cache covers" — see docs/VALIDATION-ROUND-4.md.
+    Denoise {
+        #[arg(long)] spec: PathBuf,
+        #[arg(long)] weights: PathBuf,
+        #[arg(long)] cache: PathBuf,
+        /// Index into the cache manifest. Clip-major, so with N draws per clip,
+        /// shard k belongs to clip k / N.
+        #[arg(long, default_value_t = 0)] shard: usize,
+        #[arg(long)] output: PathBuf,
+        /// Also write the teacher's reconstruction from the same shard, through
+        /// the same code path. This is the control: the two files then differ
+        /// only in whose velocity produced them.
+        #[arg(long)] teacher_output: Option<PathBuf>,
+        #[arg(long, default_value = "wgpu")] backend: String,
+        #[arg(long, value_enum, default_value_t = Precision::F32)] precision: Precision,
+    },
 }
 
 fn main() -> Result<()> {
@@ -348,6 +367,11 @@ fn main() -> Result<()> {
         Command::Eval { spec, weights, cache, backend, precision, limit } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
             dispatch!(evaluate, &backend, precision, (&spec, &weights, &cache, limit))?;
+        }
+        Command::Denoise { spec, weights, cache, shard, output, teacher_output, backend, precision } => {
+            let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
+            let args = DenoiseArgs { spec, weights, cache, shard, output, teacher_output };
+            dispatch!(denoise, &backend, precision, (&args))?;
         }
     }
     Ok(())
