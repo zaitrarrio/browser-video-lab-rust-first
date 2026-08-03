@@ -251,6 +251,13 @@ enum Command {
         #[arg(long, default_value_t = 1.0)] w_output: f32,
         #[arg(long, default_value_t = 0.25)] w_temporal: f32,
         #[arg(long, default_value_t = 0.05)] w_feature: f32,
+        /// Weight on the multi-scale (mean-pooled) MSE term. docs/VALIDATION-ROUND-6.md
+        /// measures the student missing the 0.10-0.25 spatial-frequency band, which
+        /// carries only 7-13% of the target's energy and so is nearly invisible to
+        /// the full-resolution MSE. 0 reproduces every run before that round.
+        #[arg(long, default_value_t = 0.0)] w_multiscale: f32,
+        /// How many 2x poolings to add terms for. 40x40 admits 2 (20x20, 10x10).
+        #[arg(long, default_value_t = 2)] multiscale_levels: usize,
         #[arg(long, default_value_t = 10)] log_every: usize,
         #[arg(long, default_value_t = 0)] ckpt_every: usize,
         #[arg(long, default_value_t = 42)] seed: u64,
@@ -344,13 +351,13 @@ fn main() -> Result<()> {
             synth_cache(&spec, &output, shards, frames, height, width, seq, teacher_text_width, relation_layers, seed, draws_per_clip)?;
             println!("wrote {} synthetic shards to {}", shards * draws_per_clip, output.display());
         }
-        Command::Train { spec, cache, output, backend, precision, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile, allow_f16_training } => {
+        Command::Train { spec, cache, output, backend, precision, steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, w_multiscale, multiscale_levels, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile, allow_f16_training } => {
             // Before the cache is opened or a weight allocated, as with the other
             // precision guards: the point is to cost nothing rather than to fail
             // ten steps into a GPU run.
             require_trainable(precision, allow_f16_training)?;
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile };
+            let settings = TrainSettings { steps, lr, weight_decay, grad_clip, w_output, w_temporal, w_feature, w_multiscale, multiscale_levels, log_every, ckpt_every, seed, resume, max_seconds, target_steps, shard_cache, accum, profile };
             let (losses, state) = dispatch!(run_train, &backend, precision, (spec, &cache, &output, &settings))?;
             println!(
                 "chunk done · {} steps this chunk · {}/{} total · final loss {:.6} · stopped by {} · {} · artifacts in {}",

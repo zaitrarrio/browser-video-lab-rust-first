@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use video_contract::{validate_cache, StudentSpec, TeacherCacheManifest, TensorShape};
-use video_student::{relation, temporal_difference, BrowserVideoStudent};
+use video_student::{relation, spatial_pool2, temporal_difference, BrowserVideoStudent};
 
 pub mod sample;
 
@@ -35,6 +35,11 @@ pub struct TrainSettings {
     pub w_output: f32,
     pub w_temporal: f32,
     pub w_feature: f32,
+    /// Weight on the multi-scale term: MSE between mean-pooled copies of the
+    /// prediction and the target at 2x, 4x, ... `multiscale_levels` deep.
+    /// 0 disables it and reproduces every run before docs/VALIDATION-ROUND-6.md.
+    pub w_multiscale: f32,
+    pub multiscale_levels: usize,
     pub log_every: usize,
     pub ckpt_every: usize,
     pub seed: u64,
@@ -65,7 +70,7 @@ pub struct TrainSettings {
 }
 impl Default for TrainSettings {
     fn default() -> Self {
-        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128, accum: 1, profile: false }
+        Self { steps: 100, lr: 1e-4, weight_decay: 0.01, grad_clip: 1.0, w_output: 1.0, w_temporal: 0.25, w_feature: 0.05, w_multiscale: 0.0, multiscale_levels: 2, log_every: 10, ckpt_every: 0, seed: 42, resume: None, max_seconds: 0, target_steps: 0, shard_cache: 128, accum: 1, profile: false }
     }
 }
 
@@ -383,7 +388,7 @@ fn linspace_idx(len: usize, pairs: usize) -> Vec<usize> {
     (0..pairs).map(|i| (i as f64 * (len - 1) as f64 / (pairs - 1) as f64) as usize).collect()
 }
 
-pub struct StepMetrics { pub output: f32, pub temporal: f32, pub feature: f32, pub total: f32 }
+pub struct StepMetrics { pub output: f32, pub temporal: f32, pub feature: f32, pub multiscale: f32, pub total: f32 }
 
 /// Best-effort: which hidden layer first carries a non-finite value, by replaying
 /// the step's micro-batch through the *inference* model.
@@ -577,7 +582,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         let (mut layer0_norm, mut layer0_max) = (f32::NAN, f32::NAN);
         let (mut layerlast_norm, mut layerlast_max) = (f32::NAN, f32::NAN);
         let mut accumulator = GradientsAccumulator::new();
-        let mut m = StepMetrics { output: 0.0, temporal: 0.0, feature: 0.0, total: 0.0 };
+        let mut m = StepMetrics { output: 0.0, temporal: 0.0, feature: 0.0, multiscale: 0.0, total: 0.0 };
         // Per-component losses summed *on device* across micro-steps. Reading each
         // of `output`/`temporal`/`feature` per micro-step meant 3·accum blocking
         // device→host round trips per optimizer step (24 at accum=8), each of which
@@ -608,6 +613,26 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
 
             let (pred, hidden) = model.forward(noisy, timestep, prompt);
             let output = mse(pred.clone(), teacher.clone());
+            // Low-pass MSE at 2x, 4x, ... The band round 6 found missing (0.10-0.25
+            // normalised radial frequency, ~5-14 cells in a 40x40 latent) survives
+            // pooling to 10x10 while the highest band — which the student already
+            // fits to 0.9 and which is 23-36% of the energy — does not, so each
+            // extra level shifts the objective toward the scales that carry objects.
+            let multiscale = if s.w_multiscale > 0.0 && s.multiscale_levels > 0 {
+                let (mut p, mut t) = (pred.clone(), teacher.clone());
+                let mut acc = output.zeros_like();
+                let mut used = 0usize;
+                for _ in 0..s.multiscale_levels {
+                    let (pp, tt) = (spatial_pool2(p.clone()), spatial_pool2(t.clone()));
+                    // `spatial_pool2` is the identity on an odd axis; stop rather
+                    // than add the same scale twice.
+                    if pp.dims() == p.dims() { break }
+                    p = pp; t = tt;
+                    acc = acc + mse(p.clone(), t.clone());
+                    used += 1;
+                }
+                if used == 0 { output.zeros_like() } else { acc.div_scalar(used as f32) }
+            } else { output.zeros_like() };
             let temporal = if sample.noisy.1[2] > 1 { mse(temporal_difference(pred), temporal_difference(teacher)) } else { output.zeros_like() };
             let feature = if sample.relations.is_empty() { output.zeros_like() } else {
                 let pairs = sample.relations.len().min(hidden.len());
@@ -622,7 +647,8 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             // over the batch and `lr` keeps the same meaning at any `accum`.
             let loss = (output.clone().mul_scalar(s.w_output)
                 + temporal.clone().mul_scalar(s.w_temporal)
-                + feature.clone().mul_scalar(s.w_feature))
+                + feature.clone().mul_scalar(s.w_feature)
+                + multiscale.clone().mul_scalar(s.w_multiscale))
                 .div_scalar(accum as f32);
 
             // Read before backward(): this is the forward-pass hidden state,
@@ -630,7 +656,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
             if want_stats && micro == 0 {
                 stats = Some(Tensor::cat(vec![hidden_stats(&hidden[0]), hidden_stats(&hidden[hidden.len() - 1])], 0));
             }
-            let triple = Tensor::cat(vec![output.detach(), temporal.detach(), feature.detach()], 0);
+            let triple = Tensor::cat(vec![output.detach(), temporal.detach(), feature.detach(), multiscale.detach()], 0);
             totals = Some(match totals { Some(t) => t + triple, None => triple });
 
             accumulator.accumulate(&model, GradientsParams::from_grads(loss.backward(), &model));
@@ -649,9 +675,9 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         prof.lap(Phase::Readback, sync);
         // Micro-step means, as before — the sum happened on device rather than in
         // the `m.output += o / accum` running total, so the value is unchanged.
-        (m.output, m.temporal, m.feature) = (v[0] / accum as f32, v[1] / accum as f32, v[2] / accum as f32);
-        if want_stats { [layer0_norm, layer0_max, layerlast_norm, layerlast_max] = [v[3], v[4], v[5], v[6]] }
-        m.total = m.output * s.w_output + m.temporal * s.w_temporal + m.feature * s.w_feature;
+        (m.output, m.temporal, m.feature, m.multiscale) = (v[0] / accum as f32, v[1] / accum as f32, v[2] / accum as f32, v[3] / accum as f32);
+        if want_stats { [layer0_norm, layer0_max, layerlast_norm, layerlast_max] = [v[4], v[5], v[6], v[7]] }
+        m.total = m.output * s.w_output + m.temporal * s.w_temporal + m.feature * s.w_feature + m.multiscale * s.w_multiscale;
 
         // Non-finite is decided before the update, exactly as before: skipping the
         // step must leave the weights untouched, which is only true while
@@ -665,7 +691,7 @@ pub fn train<B: AutodiffBackend>(spec: StudentSpec, cache: &Path, out: &Path, s:
         state.last_loss = m.total;
         if m.total < state.best_loss { state.best_loss = m.total; }
         let line = serde_json::json!({
-            "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "total": m.total,
+            "step": step, "output": m.output, "temporal": m.temporal, "feature": m.feature, "multiscale": m.multiscale, "total": m.total,
             "layer0_norm": layer0_norm, "layer0_max": layer0_max,
             "layerlast_norm": layerlast_norm, "layerlast_max": layerlast_max,
         });

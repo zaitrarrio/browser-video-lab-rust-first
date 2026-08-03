@@ -167,6 +167,29 @@ impl<B: Backend> BrowserVideoStudent<B> {
 pub fn relation<B:Backend>(x:Tensor<B,3>)->Tensor<B,3>{let norm=x.clone().powf_scalar(2.0).sum_dim(2).sqrt().clamp_min(1e-6);let x=x/norm;x.clone().matmul(x.swap_dims(1,2))}
 pub fn temporal_difference<B:Backend>(x:Tensor<B,5>)->Tensor<B,5>{let d=x.dims();let t=d[2];x.clone().slice([0..d[0],0..d[1],1..t,0..d[3],0..d[4]])-x.slice([0..d[0],0..d[1],0..t-1,0..d[3],0..d[4]])}
 
+/// Mean-pool the two spatial axes of a `[b,c,t,h,w]` latent by 2, or return it
+/// unchanged when either axis is odd.
+///
+/// Mean pooling is a low-pass filter, which is the point. `docs/VALIDATION-ROUND-6.md`
+/// measures the student at 0.88-0.94 cosine in the highest spatial-frequency band
+/// and ~0.48 at half magnitude in the 0.10-0.25 band, and that band carries only
+/// 7-13% of the target's energy — so an unweighted MSE over the full-resolution
+/// latent barely asks for it. An MSE term on pooled copies re-weights the objective
+/// toward exactly the scales that are missing.
+///
+/// Written as reshape-and-mean rather than `avg_pool2d` because the latent is rank 5
+/// while Burn's pooling takes rank 4, and because reducing one axis at a time keeps
+/// every intermediate at rank 6 — the NdArray ceiling the patchify in `forward` is
+/// already written around.
+pub fn spatial_pool2<B: Backend>(x: Tensor<B, 5>) -> Tensor<B, 5> {
+    let [b, c, t, h, w] = x.dims();
+    if h % 2 != 0 || w % 2 != 0 { return x }
+    // Split h into (h/2, 2) with the pair index fast-varying, average it away, then
+    // the same for w. Row-major makes both reshapes pure re-indexing.
+    let x = x.reshape([b, c, t, h / 2, 2, w]).mean_dim(4).reshape([b, c, t, h / 2, w]);
+    x.reshape([b, c, t, h / 2, w / 2, 2]).mean_dim(5).reshape([b, c, t, h / 2, w / 2])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +231,33 @@ mod tests {
     // here is 16 tokens against a block of 5 — four tiles, the last one short,
     // which is the ragged case `block ∤ seq` that off-by-one bugs live in.
     #[test]
+    // A wrong reshape here would not fail loudly — it would silently train the
+    // multi-scale term against a permuted target, which is worse than not having
+    // the term at all. Pin it against hand-computed 2x2 means.
+    #[test]
+    fn spatial_pool2_averages_2x2_blocks() {
+        type B = burn::backend::NdArray<f32>;
+        let d = Default::default();
+        // one [1,1,1,2,4] latent: two 2x2 blocks with means 3.5 and 5.5
+        let x = Tensor::<B, 1>::from_floats([1., 2., 5., 6., 3., 4., 7., 8.].as_slice(), &d)
+            .reshape([1, 1, 1, 2, 4]);
+        let y = spatial_pool2(x);
+        assert_eq!(y.dims(), [1, 1, 1, 1, 2]);
+        let v = y.into_data().convert::<f32>().into_vec::<f32>().unwrap();
+        assert!((v[0] - 2.5).abs() < 1e-6, "got {v:?}");
+        assert!((v[1] - 6.5).abs() < 1e-6, "got {v:?}");
+    }
+
+    // Odd axes must be left alone rather than truncated: the loss loop uses an
+    // unchanged shape as its signal to stop adding levels.
+    #[test]
+    fn spatial_pool2_is_identity_on_odd_axes() {
+        type B = burn::backend::NdArray<f32>;
+        let d = Default::default();
+        let x = Tensor::<B, 1>::from_floats([1., 2., 3.].as_slice(), &d).reshape([1, 1, 1, 1, 3]);
+        assert_eq!(spatial_pool2(x).dims(), [1, 1, 1, 1, 3]);
+    }
+
     fn tiled_attention_matches_single_shot() {
         let device = NdArrayDevice::default();
         <Cpu as Backend>::seed(&device, 11);
