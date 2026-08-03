@@ -226,6 +226,20 @@ pub fn spatial_pool2<B: Backend>(x: Tensor<B, 5>) -> Tensor<B, 5> {
     x.reshape([b, c, t, h / 2, w / 2, 2]).mean_dim(5).reshape([b, c, t, h / 2, w / 2])
 }
 
+/// Serialises the tests that build a `BrowserVideoStudent`.
+///
+/// Burn's `Backend::seed` sets a *process-global* RNG, so a test that seeds and
+/// then constructs a model is only correct if nothing else draws from that RNG in
+/// between. `quant.rs`'s round-trip test does exactly that — seed 11, build,
+/// seed 999, build — and cargo runs the crate's tests on several threads, so any
+/// other model-constructing test landing between the two lines silently changes
+/// what it is comparing against. It failed intermittently, passed 6/6 in
+/// isolation, and reproduced under workspace-wide parallelism. Every test that
+/// constructs a model takes this lock; poisoning is ignored because a panic in one
+/// test should surface as that test's failure, not as a cascade.
+#[cfg(test)]
+pub(crate) static MODEL_RNG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +253,7 @@ mod tests {
     // `heads` (the prior bug) would produce identical output for both.
     #[test]
     fn heads_are_actually_used() {
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
         let device = NdArrayDevice::default();
         // 4×4 latent → 2×2 = 4 tokens after patch_size [1,2,2]; multi-head only
         // matters with more than one token, so keep post-patch tokens > 1.
@@ -366,6 +381,7 @@ mod tests {
     // they are not, because each block does real work from the start.
     #[test]
     fn per_block_conditioning_is_identity_at_initialisation() {
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
         let device = NdArrayDevice::default();
         let off = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 3, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2], per_block_conditioning: false };
         let on = StudentSpec { per_block_conditioning: true, ..off.clone() };
@@ -395,6 +411,7 @@ mod tests {
     // look enabled and change nothing about sigma sensitivity.
     #[test]
     fn per_block_conditioning_carries_sigma_into_every_block() {
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
         let device = NdArrayDevice::default();
         let spec = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 3, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2], per_block_conditioning: true };
         <Cpu as Backend>::seed(&device, 5);
@@ -427,6 +444,7 @@ mod tests {
     // would be identical.
     #[test]
     fn prompt_conditions_the_output() {
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
         let device = NdArrayDevice::default();
         let spec = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 1, heads: 2, mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2], per_block_conditioning: false };
         <Cpu as Backend>::seed(&device, 3);

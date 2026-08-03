@@ -155,6 +155,7 @@ mod tests {
     // is lossier than int8 but still recovers most of the signal, at half the size.
     #[test]
     fn quantized_bundle_reconstructs_the_model() {
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
         let device = NdArrayDevice::default();
         let (latents, timestep, prompt) = inputs(&device);
 
