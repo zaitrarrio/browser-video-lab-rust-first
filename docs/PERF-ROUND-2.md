@@ -1,16 +1,25 @@
 # Performance round 2 — the card is 90% idle, and the lever is the model's shape
 
 One measurement session on a rented RTX 5090, run alongside the overfit probe
-([`OVERFIT-PROBE.md`](OVERFIT-PROBE.md)). Three results, in the order they were
+([`OVERFIT-PROBE.md`](OVERFIT-PROBE.md)). Four results, in the order they were
 found, because each one motivated the next:
 
-1. The trainer reaches **9–20% of the card's bf16 matmul throughput**, and the
+1. The trainer reaches **7–16% of the card's bf16 matmul throughput**, and the
    CUDA backend did not fix what round 1 blamed on wgpu.
 2. The idle capacity is **not** recoverable by running more jobs — co-locating a
    second trainer lowered aggregate throughput.
 3. At a **fixed parameter count**, arithmetic efficiency rises monotonically with
    width: 8.5% of peak at width 640, 25.2% at width 2304. That is a **1.72×**
    wall-clock win over the shipped geometry, available from a spec-file edit.
+4. **cubecl's matmul autotuning had never been compiled in.** `default-features
+   = false` on the workspace's burn pin — correct, and there for the wasm graph —
+   also stripped `autotune` from the native CUDA trainer. Restoring it is worth
+   **+41.6%** at production geometry and changes no code. Kernel *fusion*, turned
+   on alongside it, is a **regression** (§5).
+
+Sections 1–3 were all measured **before** finding 4, so every absolute figure in
+them is a no-autotune figure. The relative conclusions survive; the absolute ones
+are superseded by §5.
 
 ## 1. What the card actually does
 
@@ -28,9 +37,16 @@ Against the trainer, computing FLOPs as
 
 | run | samples/s | achieved | % of bf16 peak |
 | --- | --- | --- | --- |
-| 79M probe (w640 · 16L), cuda/bf16 | 9.96 | 10.7 TFLOPS | **9.4%** |
-| 383M (w1152 · 24L), cuda/bf16 | 4.07 | 18.4 TFLOPS | **16.2%** |
+| 79M probe (w640 · 16L), cuda/bf16 | 7.28 | 7.8 TFLOPS | **6.9%** |
+| 383M (w1152 · 24L), cuda/bf16 | 4.09 | 18.5 TFLOPS | **16.3%** |
 | 383M, wgpu/f32 (round 1's 2.04) | 2.04 | 9.2 TFLOPS | 8.1% |
+
+(An earlier reading of 9.96 samples/s for the 79M probe was taken by differencing
+step numbers out of a live run's log. The trainer logs every 50 steps, so over a
+300-step window that carries ±17% quantisation error. Every figure in this
+document instead differences `state.json`'s accumulated `train_seconds` across
+two chunks, which is exact; the two 1152×24 measurements taken that way, in
+different sessions, agree to 0.5%.)
 
 **Correction to `PERF-ROUND-1.md` §1.** That section attributes the missing time
 to *"cubecl's wgpu backend has no tensor-core path"*, quoting ~9.6 of ~105
@@ -133,7 +149,83 @@ Other limits, stated plainly:
   between the dense and attention paths — and therefore the shape of this curve —
   will move at other resolutions.
 
-## 5. Still the biggest unexploited lever
+## 5. Autotuning was compiled out; fusion is a regression
+
+Everything above says the trainer is far off the silicon, which raises the
+strategic question — leave Burn for PyTorch, or for hand-written CUDA? Before
+answering it, check the build.
+
+`burn-cuda`'s own default features are `["std", "fusion", "autotune", …]`. The
+workspace pins burn with `default-features = false` — deliberately, so `train`
+and `dataset` and the C `libsqlite3-sys` they drag in cannot reach
+`wasm32-unknown-unknown` — and `burn/cuda` enables `burn-cuda` *without*
+`burn-cuda/default`. `cargo tree -p video-train --features cuda` confirms
+`burn-fusion` is absent from the graph. **Matmul autotuning and kernel fusion
+have never been compiled into the CUDA trainer**, and `video-train` is never in
+the wasm graph, so nothing was gained by excluding them.
+
+`Cuda<F, I>` is itself `#[cfg(feature = "fusion")] Fusion<CubeBackend<…>>`, so
+this is a manifest change and no code change. Same protocol as §3 — 8 warm-up
+steps discarded (which for the autotune arms absorbs the tuning benchmarks
+themselves), then 30 timed steps at accum 8:
+
+| features | shape | samples/s | vs baseline | % of peak |
+| --- | --- | --- | --- | --- |
+| `cuda` (baseline) | 1152 · 24 | 4.092 | — | 16.3% |
+| `cuda` + **autotune** | 1152 · 24 | **5.795** | **+41.6%** | **23.1%** |
+| `cuda` + autotune + fusion | 1152 · 24 | 5.313 | +29.8% | 21.2% |
+| `cuda` (baseline) | 640 · 16 | 7.283 | — | 6.9% |
+| `cuda` + **autotune** | 640 · 16 | **9.025** | **+23.9%** | 8.5% |
+| `cuda` + autotune + fusion | 640 · 16 | 7.461 | +2.4% | 7.0% |
+
+**Autotune is a large free win. Fusion is a net loss on top of it** — 8.3% slower
+at 1152×24 and 17% slower at 640×16. The plausible reading is that Burn's fusion
+layer pays graph-construction and dispatch bookkeeping to eliminate elementwise
+traffic that autodiff is going to tape anyway, so the saving never materialises;
+it may also be constraining what autotune is allowed to pick. `cuda` now carries
+`burn/autotune`; `cuda-fusion` remains reachable purely so the negative result
+stays reproducible.
+
+**This reprices §1 and §3.** At production geometry the trainer is at 23.1% of
+peak, not 16.3%. The 3.2M-view schedule goes from 9.1 days to **6.4 days** at
+accum 8, and round 1's 7.4-day headline to **~5.2 days** — again, for a manifest
+line. §3's width sweep was run without autotune and needs redoing before its
+1.72× can be quoted alongside this: autotune's entire job is picking good kernels
+per shape, so it is exactly the thing that could shrink — or widen — a
+shape-dependent gap.
+
+## 6. So: Rust+CUDA, or PyTorch, or TensorRT?
+
+The question this section was written to answer, with the numbers above.
+
+**The trainer is already Rust+CUDA.** What remains in Python is teacher-cache
+generation, the dataset build and the VAE decode. Round 1 §3 measured the teacher
+at 92% of TGP and listed micro-optimising it under "what not to re-attempt"; in
+this session the whole 1536-shard cache took about seven minutes. Porting Wan2.1's
+DiT, VAE and umt5 to Burn would be a very large rewrite aimed squarely at the part
+that is not the bottleneck.
+
+**TensorRT cannot train.** It builds inference engines; there is no backward pass,
+so it is structurally inapplicable to the multi-GPU-day number that motivates all
+of this. Its plausible targets here are teacher-cache generation (92% TGP already)
+and VAE decode (seconds per clip). And it can never touch the deliverable itself:
+the student ships to WebGPU/WASM, where an NVIDIA-native engine cannot go.
+
+**The 16%-of-peak figure that motivated the question was a build flag**, worth
++41.6% of the gap for one manifest line. That does not close the remaining
+distance to torch's 113.5 TFLOPS — the trainer is at 23.1% — but it changes the
+decision. The honest position:
+
+* **Stay in Rust.** The PyTorch-free trainer is a deliberate property of this
+  project (`task rust:train:smoke` exists to prove it), and the case for
+  abandoning it rested on a number that was 41% pessimistic.
+* **Re-run §3's width sweep with autotune on** before spending anything on shape.
+* **A torch-vs-Burn head-to-head on the same student is still worth measuring**,
+  because 23% of peak is not 50% — but it is now an optimisation question, not an
+  architecture question, and it should wait until the probe has said whether this
+  pipeline produces video at all.
+
+## 7. Still the biggest unexploited lever
 
 Even the best row here leaves **75% of the card unused**. Fused attention with
 recompute-on-backward remains what `PERF-ROUND-1.md` §6 said it was: at 1600

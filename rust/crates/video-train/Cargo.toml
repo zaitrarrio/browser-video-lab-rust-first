@@ -19,7 +19,22 @@ video-student = { path = "../video-student" }
 
 [features]
 # Production NVIDIA path (e.g. a Colab session): cargo run -p video-train --features cuda --release
-cuda = ["burn/cuda"]
+#
+# `burn/autotune` is not optional. `burn-cuda`'s own defaults are
+# ["std", "fusion", "autotune", ...], but the workspace pins burn with
+# `default-features = false` so that `train`/`dataset` — and the C libsqlite3-sys
+# they drag in — stay out of the wasm graph. `burn/cuda` enables `burn-cuda`
+# *without* `burn-cuda/default`, so matmul autotuning was compiled out of the
+# native trainer as collateral damage and every throughput number before
+# 2026-08-03 was measured without it. Turning it back on is worth **+41.6%** at
+# production geometry (docs/PERF-ROUND-2.md §6). video-train is never in the wasm
+# graph, so this costs the browser build nothing.
+cuda = ["burn/cuda", "burn/autotune"]
+# Kernel fusion, kept reachable only so the negative result stays reproducible:
+# measured **8.3% slower** than autotune alone at 1152x24 and 17% slower at
+# 640x16. The fusion layer's graph bookkeeping costs more than it saves once
+# autodiff is taping every intermediate anyway. Do not enable it by default.
+cuda-fusion = ["cuda", "burn/fusion"]
 
 [dev-dependencies]
 tempfile = "3"
