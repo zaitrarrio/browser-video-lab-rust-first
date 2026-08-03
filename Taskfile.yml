@@ -118,7 +118,7 @@ tasks:
     cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- estimate rust/config/browser-390m.json]
   rust:validate-cache:
     desc: Validate framework-neutral teacher shards
-    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache --path data/teacher-cache]
+    cmds: [cargo run --manifest-path rust/Cargo.toml -p video-cli -- validate-cache data/teacher-cache]
   rust:quantize:
     desc: Quantize a trained student record (student.bin/.mpk) to the Q8 bundle
     cmds: ["cargo run --release --manifest-path rust/Cargo.toml -p video-cli -- quantize --spec {{.QUANT_SPEC}} --weights {{.CHECKPOINT}} --output artifacts/student-q8 --bits 8"]
@@ -189,6 +189,13 @@ tasks:
     requires: {vars: [LATENTS]}
     cmds: ['{{.PYTHON}} -m longlive_distill.decode_latents --latents {{.LATENTS}} --output artifacts/decoded.mp4 {{.CLI_ARGS}}']
     env: {PYTHONPATH: python}
+  probe:
+    desc: 'Hours-not-days overfit probe: 4 clips -> cache -> train -> sample -> MP4. ARM=small|full, PHASE=data|check|cache|floor|train|sample|all. See docs/OVERFIT-PROBE.md.'
+    cmds: ['ARM={{.ARM}} PHASE={{.PHASE}} MAX_SECONDS={{.PROBE_SECONDS}} bash scripts/overfit-probe.sh']
+    vars:
+      ARM: '{{default "small" .ARM}}'
+      PHASE: '{{default "all" .PHASE}}'
+      PROBE_SECONDS: '{{default "14400" .PROBE_SECONDS}}'
   kaggle:dry-run:
     desc: Render the Kaggle training kernel and print its metadata without pushing
     cmds: [node scripts/kaggle-orchestrate.mjs --dry-run]

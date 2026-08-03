@@ -1,0 +1,1 @@
+{"latent_channels":16,"text_width":512,"width":640,"layers":16,"heads":8,"mlp_ratio":4,"max_tokens":8192,"patch_size":[1,2,2],"per_block_conditioning":true}
