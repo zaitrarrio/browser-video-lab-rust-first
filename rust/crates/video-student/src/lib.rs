@@ -339,6 +339,55 @@ mod tests {
         assert!(peak(laplacian_band(mk(&coarse), 1)) > 0.5, "period-4 must live in octave 1");
     }
 
+    // The student has no positional encoding: `forward` is patchify -> Linear ->
+    // add a broadcast conditioning vector -> attention blocks, and every one of
+    // those is per-token or permutation-equivariant. So rolling the latent in
+    // space must roll the output identically — the model cannot tell where a
+    // patch is, only what it contains.
+    //
+    // That is not a style point. `docs/VALIDATION-ROUND-6.md` measures the student
+    // reaching 0.90 cosine in the finest band (each token's own content) and 0.68
+    // in the coarsest (a global mean), while the 0.10-0.25 band — object-scale
+    // arrangement, the one thing that needs to know *where* — sits at 0.47 and does
+    // not move under any loss reweighting tried in round 7. A permutation-equivariant
+    // network cannot place structure that its input does not already locate, which
+    // is exactly why the failure appears at high sigma, where the input is noise.
+    //
+    // This test passes today. It is here so that adding positional encoding is a
+    // deliberate act that makes it fail, rather than something nobody notices is
+    // missing.
+    #[test]
+    fn student_is_permutation_equivariant_because_it_has_no_positional_encoding() {
+        type B = burn::backend::NdArray<f32>;
+        let _rng = crate::MODEL_RNG.lock().unwrap_or_else(|e| e.into_inner());
+        let device = Default::default();
+        let spec = StudentSpec { latent_channels: 2, text_width: 4, width: 16, layers: 2, heads: 2,
+            mlp_ratio: 2, max_tokens: 64, patch_size: [1, 2, 2], per_block_conditioning: true };
+        <B as Backend>::seed(&device, 7);
+        let model = BrowserVideoStudent::<B>::new(spec, &device);
+
+        // [1,2,1,4,4] -> a 2x2 grid of tokens. Roll by one token column.
+        let n = 2 * 1 * 4 * 4;
+        let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+        let x = Tensor::<B, 1>::from_floats(v.as_slice(), &device).reshape([1, 2, 1, 4, 4]);
+        let ts = Tensor::<B, 1>::from_floats([500.0f32].as_slice(), &device).reshape([1, 1]);
+        let pr = Tensor::<B, 1>::from_floats([0.1f32; 3 * 4].as_slice(), &device).reshape([1, 3, 4]);
+
+        let roll = |t: Tensor<B, 5>| {
+            // shift the width axis by one patch (2 cells), wrapping
+            let a = t.clone().slice([0..1, 0..2, 0..1, 0..4, 2..4]);
+            let b = t.slice([0..1, 0..2, 0..1, 0..4, 0..2]);
+            Tensor::cat(vec![a, b], 4)
+        };
+        let (y_then_roll, _) = model.forward(roll(x.clone()), ts.clone(), pr.clone());
+        let (y, _) = model.forward(x, ts, pr);
+        let diff = (roll(y) - y_then_roll).abs().max().into_data().convert::<f32>().into_vec::<f32>().unwrap()[0];
+        assert!(diff < 1e-4,
+            "the student is expected to be permutation-equivariant (no positional encoding); \
+             rolling the input no longer rolls the output identically (max diff {diff}). If you \
+             just added positional encoding, this test has done its job — delete it.");
+    }
+
     #[test]
     fn spatial_upsample2_inverts_shape_and_repeats() {
         type B = burn::backend::NdArray<f32>;
