@@ -30,6 +30,22 @@ video-student = { path = "../video-student" }
 # production geometry (docs/PERF-ROUND-2.md §6). video-train is never in the wasm
 # graph, so this costs the browser build nothing.
 cuda = ["burn/cuda", "burn/autotune"]
+# LibTorch backend: the same backend-generic model on ATen's kernels, to price how
+# much of the torch gap (docs/PERF-ROUND-2.md §6) is cubecl kernel quality rather
+# than anything about the model or the loss. Needs libtorch on the host — with a
+# torch venv already present, `LIBTORCH_USE_PYTORCH=1` points at it.
+#
+# Note this cannot reach a *fused* attention: burn-autodiff 0.21 implements
+# `attention` as an unconditional `attention_fallback`, with no
+# `B::has_attention_backward()` escape hatch of the kind `ctc_loss` has, so the
+# tch backend's `scaled_dot_product_attention` is unreachable under autodiff.
+# Expect the dense path only.
+#
+# UNVERIFIED — this arm has never been compiled. `torch-sys 0.22` pins
+# `TORCH_VERSION = "2.9.0"` and tch-rs is ABI-sensitive, so pointing it at a
+# venv's torch 2.11 via `LIBTORCH_USE_PYTORCH=1` may well fail to link; the
+# fallback is an explicit `LIBTORCH=<path to libtorch 2.9.0+cuXXX>`.
+tch = ["burn/tch"]
 # Kernel fusion, kept reachable only so the negative result stays reproducible:
 # measured **8.3% slower** than autotune alone at 1152x24 and 17% slower at
 # 640x16. The fusion layer's graph bookkeeping costs more than it saves once

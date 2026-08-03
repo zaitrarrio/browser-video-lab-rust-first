@@ -176,7 +176,25 @@ macro_rules! dispatch {
             }
             #[cfg(not(feature = "cuda"))]
             "cuda" => bail!("rebuild with --features cuda for the CUDA backend"),
-            other => bail!("unknown backend {other}; use ndarray | wgpu | cuda"),
+            // LibTorch. Same model, same loss, same optimizer — ATen's kernels
+            // instead of cubecl's, which is what makes the torch gap in
+            // docs/PERF-ROUND-2.md §6 attributable rather than just observed.
+            // `LibTorch<E>` takes one element parameter, not the `<F, I>` pair the
+            // cubecl backends do.
+            #[cfg(feature = "tch")]
+            "tch" => {
+                use burn::backend::{libtorch::LibTorchDevice, LibTorch};
+                let device = LibTorchDevice::Cuda(0);
+                require_dtype::<LibTorch>(&device, "tch", precision)?;
+                match precision {
+                    Precision::F32 => $run::<LibTorch<f32>>($($arg,)* &device),
+                    Precision::F16 => $run::<LibTorch<f16>>($($arg,)* &device),
+                    Precision::Bf16 => $run::<LibTorch<bf16>>($($arg,)* &device),
+                }
+            }
+            #[cfg(not(feature = "tch"))]
+            "tch" => bail!("rebuild with --features tch for the LibTorch backend"),
+            other => bail!("unknown backend {other}; use ndarray | wgpu | cuda | tch"),
         }
     }};
 }

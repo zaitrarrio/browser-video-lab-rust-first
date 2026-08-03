@@ -801,6 +801,7 @@ dependencies = [
  "burn-cubecl",
  "burn-fusion",
  "burn-ir",
+ "burn-tch",
  "burn-tensor",
  "bytemuck",
  "cubecl",
