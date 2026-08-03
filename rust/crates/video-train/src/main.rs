@@ -328,6 +328,10 @@ enum Command {
         /// the same code path. This is the control: the two files then differ
         /// only in whose velocity produced them.
         #[arg(long)] teacher_output: Option<PathBuf>,
+        /// Use a different shard's prompt embedding with this shard's x_σ. Same
+        /// input, different conditioning — the cheapest possible measurement of
+        /// whether the prompt path does anything at all.
+        #[arg(long)] prompt: Option<PathBuf>,
         #[arg(long, default_value = "wgpu")] backend: String,
         #[arg(long, value_enum, default_value_t = Precision::F32)] precision: Precision,
     },
@@ -368,9 +372,9 @@ fn main() -> Result<()> {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
             dispatch!(evaluate, &backend, precision, (&spec, &weights, &cache, limit))?;
         }
-        Command::Denoise { spec, weights, cache, shard, output, teacher_output, backend, precision } => {
+        Command::Denoise { spec, weights, cache, shard, output, teacher_output, prompt, backend, precision } => {
             let spec: StudentSpec = serde_json::from_slice(&fs::read(spec)?)?;
-            let args = DenoiseArgs { spec, weights, cache, shard, output, teacher_output };
+            let args = DenoiseArgs { spec, weights, cache, shard, output, teacher_output, prompt };
             dispatch!(denoise, &backend, precision, (&args))?;
         }
     }

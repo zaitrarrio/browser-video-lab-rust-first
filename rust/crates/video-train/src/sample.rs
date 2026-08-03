@@ -171,6 +171,13 @@ pub struct DenoiseArgs {
     pub shard: usize,
     pub output: PathBuf,
     pub teacher_output: Option<PathBuf>,
+    /// Swap in a different shard's prompt embedding while keeping this shard's
+    /// `x_σ`. Round 5 observed clip-appropriate *colour* in high-σ
+    /// reconstructions and inferred the prompt was carrying identity — but those
+    /// were different shards, so the colour could equally have come from `x_σ`.
+    /// Holding the input fixed and moving only the prompt is what separates the
+    /// two, and it costs one forward pass rather than a training run.
+    pub prompt: Option<PathBuf>,
 }
 
 /// One-step reconstruction from an **on-manifold** input — the measurement that
@@ -217,7 +224,14 @@ pub fn denoise<B: Backend>(a: &DenoiseArgs, device: &B::Device) -> Result<()> {
     let noisy = crate::t5::<B>(&sample.noisy, device);
     let timestep = Tensor::<B, 1>::from_floats(sample.timestep.as_slice(), device)
         .reshape([sample.timestep.len(), 1]);
-    let prompt = crate::t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device);
+    let prompt = match &a.prompt {
+        Some(p) => {
+            let (vals, seq) = read_prompt(p, a.spec.text_width)?;
+            println!("{}", serde_json::json!({"prompt_override": p.to_string_lossy()}));
+            Tensor::<B, 1>::from_floats(vals.as_slice(), device).reshape([1, seq, a.spec.text_width])
+        }
+        None => crate::t3::<B>(sample.student_prompt.as_ref().unwrap_or(&sample.prompt), device),
+    };
 
     let (v_student, _) = model.forward(noisy.clone(), timestep, prompt);
     let v_teacher = crate::t5::<B>(&sample.teacher_pred, device);
