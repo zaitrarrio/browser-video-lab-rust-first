@@ -42,27 +42,28 @@ actually ships.
 
 | arm | spec | params | why run it |
 | --- | --- | --- | --- |
-| `small` | `rust/config/probe-79m.json` | 79M + 39M adaLN | cheap falsification. ~3–4× the throughput, so ~3–4× the optimizer steps in the same hour. If *this* cannot memorize 4 clips, the defect is not capacity. |
+| `small` | `rust/config/probe-79m.json` | 79M + 39M adaLN | cheap falsification, at **2.22×** the throughput (19.618 against 8.849 samples/s — less than the 3–4× first projected, because narrower matmuls are also less efficient; `PERF-ROUND-2.md` §3). If *this* cannot memorize 4 clips, the defect is not capacity. |
 | `full` | `rust/config/validation-320-adaln.json` | 383M + 191M adaLN | the artifact worth having: the deliverable architecture, on the deliverable geometry, with real pixels out. |
 
 Run `small` first. It is the arm that can cheaply say "stop, something upstream
-is wrong", and it costs about an hour.
+is wrong", and 13k optimizer steps of it costs 90 minutes and $0.50.
 
 ## Budget
 
-RTX 5090, cuda/bf16, 1600 tokens, accum 8. The 383M figure is measured
-(`PERF-ROUND-1.md` §4); the 79M figure is an estimate from the FLOP proxies
-(`layers·width²` is 0.21×, `heads·layers` is 0.33×) and the script prints the
-real one.
+RTX 5090, cuda/bf16, 1600 tokens, accum 8, measured by the two-point slope
+protocol of [`PERF-ROUND-2.md`](PERF-ROUND-2.md) §5a — an earlier version of this
+table quoted 12–16 samples/s for the small arm from a log-differencing estimate
+that carried ±17% quantisation error, and a 4.10 figure for the full arm that a
+broken warm-up protocol had depressed.
 
-| arm | samples/s | 4 h sample-views | optimizer steps | vs round 3 |
-| --- | --- | --- | --- | --- |
-| `small` | ~12–16 *(est.)* | 170k–230k | 21k–29k | ~30× the views |
-| `full` | 4.10 *(measured)* | 59k | 7.4k | 9× the views |
+| arm | samples/s | 1.5 h sample-views | optimizer steps |
+| --- | --- | --- | --- |
+| `small` | **19.618** | 106k | 13.2k |
+| `full` | **8.849** | 48k | 6.0k |
 
-Round 1 trained for 800 optimizer steps; round 3 for 200. Plus ~25 min for the
-dataset, the f32 teacher cache and the sampling pass, the whole session is
-**~6 GPU-hours, about $5** at $0.78/h.
+The 26,513-step reference run (rounds 4–6) took 2 h 30 m and cost about $0.85.
+Plus the dataset, the f32 teacher cache and the sampling pass, a full session is
+**under 4 GPU-hours, about $1.30** at $0.335/h.
 
 ## Two corrections this plan makes to the standing advice
 
@@ -118,3 +119,20 @@ Three readouts, in increasing order of how much they can mislead:
   ~25k steps is strong evidence of a defect, but not proof: it is still fewer
   steps than a conventional diffusion schedule. It would tell you where to look,
   not what is broken.
+
+## Outcome
+
+The probe ran and the answer was no. What it cost to find that out, and what the
+follow-on diagnostics turned it into, are in
+[`VALIDATION-ROUND-4.md`](VALIDATION-ROUND-4.md) (parity clears the floor by
++0.376 and the sample still has no structure),
+[`VALIDATION-ROUND-5.md`](VALIDATION-ROUND-5.md) (the failure is at high σ, on
+on-manifold inputs, so it is not sampler drift) and
+[`VALIDATION-ROUND-6.md`](VALIDATION-ROUND-6.md) (it is one spatial-frequency
+band, and the loss barely mentions it).
+
+The paragraph above proved too pessimistic in a useful way. "Failure to memorize
+is not proof" is true, but the *shape* of the failure turned out to be far more
+informative than its existence: four analyses costing about twenty minutes of GPU
+between them narrowed "the pipeline does not draw" to a named, measured defect
+with a numeric target. Budget for the diagnostics, not just the run.

@@ -196,6 +196,26 @@ tasks:
       ARM: '{{default "small" .ARM}}'
       PHASE: '{{default "all" .PHASE}}'
       PROBE_SECONDS: '{{default "14400" .PROBE_SECONDS}}'
+  probe:denoise:
+    desc: 'One-step x0 reconstruction from a cache shard using the student''s own velocity — separates "cannot draw" from "sampler drifts". Set WEIGHTS, CACHE, SHARD.'
+    requires: {vars: [WEIGHTS, CACHE]}
+    cmds:
+      - cargo run --release --features cuda --manifest-path rust/Cargo.toml -p video-train -- denoise --spec {{.TRAIN_SPEC}} --weights {{.WEIGHTS}} --cache {{.CACHE}} --shard {{.SHARD}} --output artifacts/denoise.safetensors --teacher-output artifacts/denoise-teacher.safetensors --backend cuda --precision f32 {{.CLI_ARGS}}
+    vars: {SHARD: '{{default "0" .SHARD}}'}
+  probe:targets:
+    desc: 'Where the training signal lives: gradient budget and echo-residual by sigma band. No GPU, no model. Set CACHE.'
+    requires: {vars: [CACHE]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.analyze_targets --cache {{.CACHE}} {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
+  probe:closed-form:
+    desc: 'How far the stored targets sit from (x_s - x0)/s — i.e. what a perfect memoriser could reach. Set CACHE, DATASET, DRAWS.'
+    requires: {vars: [CACHE, DATASET, DRAWS]}
+    cmds: ['{{.PYTHON}} -m longlive_distill.closed_form_target --cache {{.CACHE}} --dataset {{.DATASET}} --draws-per-clip {{.DRAWS}} {{.CLI_ARGS}}']
+    env: {PYTHONPATH: python}
+  probe:spectrum:
+    desc: 'Student-vs-teacher velocity cosine by spatial frequency — the band round 6 found missing. Set SHARD_FILE and RECON.'
+    requires: {vars: [SHARD_FILE, RECON]}
+    cmds: ['{{.PYTHON}} python/longlive_distill/spectrum.py {{.SHARD_FILE}} {{.RECON}}']
   kaggle:dry-run:
     desc: Render the Kaggle training kernel and print its metadata without pushing
     cmds: [node scripts/kaggle-orchestrate.mjs --dry-run]
