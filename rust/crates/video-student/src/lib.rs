@@ -181,6 +181,42 @@ pub fn temporal_difference<B:Backend>(x:Tensor<B,5>)->Tensor<B,5>{let d=x.dims()
 /// while Burn's pooling takes rank 4, and because reducing one axis at a time keeps
 /// every intermediate at rank 6 — the NdArray ceiling the patchify in `forward` is
 /// already written around.
+/// Nearest-neighbour 2x upsample of the two spatial axes — the inverse pairing for
+/// `spatial_pool2` in a Laplacian band.
+///
+/// `repeat_dim` on an inserted axis, then fold it back, so every intermediate stays
+/// at rank 6 for the same reason `spatial_pool2` does.
+pub fn spatial_upsample2<B: Backend>(x: Tensor<B, 5>) -> Tensor<B, 5> {
+    let [b, c, t, h, w] = x.dims();
+    let x = x.reshape([b, c, t, h, 1, w]).repeat_dim(4, 2).reshape([b, c, t, h * 2, w]);
+    x.reshape([b, c, t, h * 2, w, 1]).repeat_dim(5, 2).reshape([b, c, t, h * 2, w * 2])
+}
+
+/// One octave of a Laplacian pyramid: the content `spatial_pool2` keeps minus the
+/// content one further pooling keeps, i.e. a **band-pass** rather than a low-pass.
+///
+/// This exists because the low-pass version did not work.
+/// `docs/VALIDATION-ROUND-7.md` measures a multi-scale (pooled MSE) term moving the
+/// 0.00–0.10 band from 0.684 to 0.773 and leaving the missing 0.10–0.25 band at
+/// 0.466 against a control's 0.470 — because a pooled MSE contains *everything*
+/// below its cutoff, and the 0.00–0.10 band carries 31% of the target's energy
+/// against the target band's 12%, so it still dominates 2.6:1 inside the new term.
+///
+/// Subtracting the next octave removes exactly that. In a 40x40 latent, one
+/// `spatial_pool2` keeps normalised radial frequency below ~0.354 and two keep
+/// below ~0.177, so `band(x, 1)` isolates roughly 0.177–0.354 and `band(x, 2)`
+/// roughly 0.088–0.177 — between them bracketing the band that is missing, and
+/// excluding the one that is not.
+pub fn laplacian_band<B: Backend>(x: Tensor<B, 5>, octave: usize) -> Tensor<B, 5> {
+    let mut lo = x;
+    for _ in 0..octave { lo = spatial_pool2(lo) }
+    let coarser = spatial_pool2(lo.clone());
+    // Odd axis: `spatial_pool2` is the identity, so the band would be all-zero.
+    // Return it as such rather than pretending there is signal there.
+    if coarser.dims() == lo.dims() { return lo.zeros_like() }
+    lo - spatial_upsample2(coarser)
+}
+
 pub fn spatial_pool2<B: Backend>(x: Tensor<B, 5>) -> Tensor<B, 5> {
     let [b, c, t, h, w] = x.dims();
     if h % 2 != 0 || w % 2 != 0 { return x }
@@ -256,6 +292,47 @@ mod tests {
         let d = Default::default();
         let x = Tensor::<B, 1>::from_floats([1., 2., 3.].as_slice(), &d).reshape([1, 1, 1, 1, 3]);
         assert_eq!(spatial_pool2(x).dims(), [1, 1, 1, 1, 3]);
+    }
+
+    // Pins the octave semantics, which are easy to get off by one: `band(x, k)`
+    // isolates what survives k poolings but not k+1, so octave 0 is the *highest*
+    // frequencies and each further octave is one scale coarser.
+    #[test]
+    fn laplacian_band_is_band_pass_and_octave_indexed() {
+        type B = burn::backend::NdArray<f32>;
+        let d = Default::default();
+        let mk = |f: &dyn Fn(usize, usize) -> f32| {
+            let mut v = vec![0.0f32; 64];
+            for y in 0..8 { for x in 0..8 { v[y * 8 + x] = f(x, y) } }
+            Tensor::<B, 1>::from_floats(v.as_slice(), &d).reshape([1, 1, 1, 8, 8])
+        };
+        let peak = |t: Tensor<B, 5>| t.abs().max().into_data().convert::<f32>().into_vec::<f32>().unwrap()[0];
+
+        // Pure DC has no band energy at any octave.
+        for k in 0..2 {
+            let e = peak(laplacian_band(mk(&|_, _| 3.0), k));
+            assert!(e < 1e-6, "constant field, octave {k}: expected 0, got {e}");
+        }
+        // Period 2 (per-cell checkerboard) is the finest scale: octave 0 only.
+        let fine = |x: usize, y: usize| if (x + y) % 2 == 0 { 1.0 } else { -1.0 };
+        assert!(peak(laplacian_band(mk(&fine), 0)) > 0.5, "period-2 must live in octave 0");
+        assert!(peak(laplacian_band(mk(&fine), 1)) < 1e-6, "period-2 must not reach octave 1");
+        // Period 4 (2x2 blocks) is one scale coarser: octave 1, and invisible to 0
+        // because one pooling reproduces it exactly.
+        let coarse = |x: usize, y: usize| if ((x / 2) + (y / 2)) % 2 == 0 { 1.0 } else { -1.0 };
+        assert!(peak(laplacian_band(mk(&coarse), 0)) < 1e-6, "period-4 must not leak into octave 0");
+        assert!(peak(laplacian_band(mk(&coarse), 1)) > 0.5, "period-4 must live in octave 1");
+    }
+
+    #[test]
+    fn spatial_upsample2_inverts_shape_and_repeats() {
+        type B = burn::backend::NdArray<f32>;
+        let d = Default::default();
+        let x = Tensor::<B, 1>::from_floats([1., 2.].as_slice(), &d).reshape([1, 1, 1, 1, 2]);
+        let y = spatial_upsample2(x);
+        assert_eq!(y.dims(), [1, 1, 1, 2, 4]);
+        let v = y.into_data().convert::<f32>().into_vec::<f32>().unwrap();
+        assert_eq!(v, vec![1., 1., 2., 2., 1., 1., 2., 2.]);
     }
 
     fn tiled_attention_matches_single_shot() {
