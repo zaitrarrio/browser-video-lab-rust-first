@@ -1,26 +1,28 @@
-# Performance round 2 — the trainer is far off the card, and one protocol bug
-
-> **Read §6a first.** A measurement-protocol error means the Burn figures in §3,
-> §5 and §6 are too low, and the torch/Burn ratios are overstated. Corrected where
-> a corrected number exists; flagged where one does not.
+# Performance round 2 — the gap to torch is not cubecl's kernels
 
 One measurement session on a rented RTX 5090 (`$0.335/h`, Florida), run alongside
-the overfit probe ([`OVERFIT-PROBE.md`](OVERFIT-PROBE.md)). Six results, in the
-order they were found, because each one motivated the next:
+the overfit probe ([`OVERFIT-PROBE.md`](OVERFIT-PROBE.md)). What was learned, in
+the order it was found, because each result motivated the next:
 
-1. The trainer reaches **3–8% of the card's bf16 matmul throughput** (§1).
+1. The trainer reaches a small fraction of the card's bf16 matmul throughput (§1).
 2. That idle capacity is **not** recoverable by scheduling — co-locating a second
    trainer *lowered* aggregate throughput (§2).
-3. At a **fixed parameter count**, efficiency rises monotonically with width:
-   4.1% of peak at width 640, 12.0% at width 2304, a **1.72×** wall-clock win
-   from a spec-file edit (§3).
-4. **cubecl's matmul autotuning had never been compiled in.** Restoring it is
-   worth **+41.6%** and changes no code. Kernel *fusion* is a regression (§5).
-5. **The same model in PyTorch is 3.5× faster at production geometry and 6.5×
-   faster at the probe's**, and two thirds of that gap is *not* about fused
-   attention (§6).
-6. But the Rust trainer is a **65 MB binary that links no CUDA libraries at
-   all**, against a 7.0 GB torch environment (§7).
+3. At a **fixed parameter count**, efficiency rises monotonically with width — a
+   **1.72×** wall-clock win from a spec-file edit (§3).
+4. **cubecl's matmul autotuning had never been compiled in**, and restoring it
+   changes no code. Kernel *fusion*, on top of it, is a regression (§5).
+5. **The first measurement protocol was wrong** and under-reported Burn; §5a has
+   the fix, two independent validations of it, and which tables it invalidates.
+6. **Running the identical Rust model on LibTorch's kernels buys 3%.** The 2.28×
+   torch advantage at production geometry is 1.03× kernels, 1.35× framework
+   overhead, 1.63× fused attention — and the fused-attention kernel **already
+   exists in `burn-cubecl`**; `burn-autodiff` discards it (§6).
+7. The Rust trainer is a **65 MB binary linking no CUDA libraries at all**,
+   against a 7.0 GB torch environment (§7).
+
+**Bottom line: do not adopt `burn-tch`, and do not port the trainer to PyTorch on
+current evidence.** Make attention's backward reachable in Burn instead — that is
+1.63× and it keeps the binary.
 
 ## 1. What the card actually does
 
@@ -144,143 +146,136 @@ and no code change.
 | `cuda` + **autotune** | 640 · 16 | **9.025** | **+23.9%** | 4.1% |
 | `cuda` + autotune + fusion | 640 · 16 | 7.461 | +2.4% | 3.3% |
 
-**Autotune is a large free win; fusion is a net loss on top of it** — 8.3% slower
-at 1152×24, 17% at 640×16. The plausible reading is that Burn's fusion layer pays
-graph bookkeeping to remove elementwise traffic autodiff tapes anyway, and may
-constrain what autotune can pick. `cuda` now carries `burn/autotune`;
-`cuda-fusion` stays reachable only so the negative result is reproducible.
+**Autotune is a large free win; fusion is a net loss on top of it.** The sign and
+ordering are trustworthy; the magnitudes in that table are **not** — see §5a. The
+plausible reading of fusion is that Burn's fusion layer pays graph bookkeeping to
+remove elementwise traffic autodiff tapes anyway, and may constrain what autotune
+can pick. `cuda` now carries `burn/autotune`; `cuda-fusion` stays reachable only so
+the negative result is reproducible.
 
-## 6. The same model in PyTorch
+## 5a. The measurement protocol, and the bug in the first one
+
+**The bug.** §3 and §5 ran a "warm-up" chunk and a "timed" chunk as *separate
+processes*, subtracting `state.json`'s accumulated `train_seconds`. That cancels
+nothing: `--resume` starts a fresh binary and cubecl's JIT and autotune caches are
+per-process, so every timed chunk paid full kernel-compilation and tuning cost
+inside its own measured window.
+
+**The fix.** Model a process as `t(N) = S + N/r` and take two fresh runs at
+different step counts:
+
+```
+r = (N₂ − N₁) / (t₂ − t₁)          N₁ = 40, N₂ = 200
+```
+
+which removes a constant per-process startup instead of pretending a previous
+process warmed it away.
+
+**Two independent checks that it works.**
+
+| check | slope protocol | reference | agreement |
+| --- | --- | --- | --- |
+| burn-cuda 640×16 | 19.618 | 19.567, from a 22,013-step single-process run | **0.26%** |
+| burn-cuda 1152×24 | 8.849 | 8.86, predicted analytically from S | **0.12%** |
+
+The fitted startup is **13.9 s for cubecl** on both shapes — constant, as the model
+assumes — and **0.2–0.4 s for LibTorch**, whose kernels are precompiled and need no
+JIT or autotune. That difference is itself the cleanest confirmation of what was
+leaking.
+
+**Consequences.** §3's width sweep and §5's table both still carry the leak. A
+constant `S` inflates a *fast* config's measured time by a larger fraction, so both
+**understate** the fast rows: the true width advantage in §3 is larger than 1.72×,
+and autotune's true value is larger than +41.6%. Neither has been re-run; the
+corrected `cuda` figures at 640×16 and 1152×24 in §6 are the only Burn numbers in
+this document measured properly.
+
+## 6. Burn against PyTorch, and against LibTorch
 
 `python/bench_torch_student.py` reimplements `video-student` — same patchify, same
-adaLN-zero blocks, same three-term loss (output MSE + 0.25 temporal + 0.05
-relation grams over two layers), same AdamW at lr 2e-5 / wd 0.01 / clip 1.0, same
-accum 8, all in bf16. Structural parity is checked, not assumed: torch reports
-574.6M parameters against the Rust `approximate_parameters` formula's 574.0M, the
-difference being the biases and LayerNorms that formula omits.
+adaLN-zero blocks, same three-term loss, same AdamW at lr 2e-5 / wd 0.01 / clip
+1.0, same accum 8, bf16 throughout. Structural parity is checked, not assumed:
+torch reports 574.6M parameters against the Rust `approximate_parameters`
+formula's 574.0M, the difference being the biases and LayerNorms it omits.
 
-Three attention arms, because *"torch is faster"* and *"torch has a fused
-attention kernel Burn 0.21 lacks"* are different claims with different
-consequences. The `naive` arm materializes the same `[b, heads, N, N]` matrix
-`tiled_attention` does.
+`--backend tch` runs the **identical Rust model** on LibTorch's ATen kernels —
+same trainer, same loss, same optimizer, same checkpoints, one dispatch arm. That
+is what separates *"cubecl's kernels are slow"* from *"Burn is slow"*, which no
+comparison against Python could distinguish.
 
-**Production geometry, 1152 · 24 · 16H, 1600 tokens:**
+All Burn figures below use the two-point slope protocol of §5a. torch is timed
+in-process after 3 warm-up iterations.
 
-| implementation | attention | samples/s | TFLOPS | % of peak | peak mem |
+| implementation | 640 · 16 | vs burn-cuda | 1152 · 24 | vs burn-cuda | % of peak |
 | --- | --- | --- | --- | --- | --- |
-| Burn, no autotune | tiled | 4.092 | 18.5 | 7.7% | — |
-| Burn, **autotune** | tiled | 5.795 | 26.2 | 10.9% | — |
-| torch | naive | 12.352 | 55.8 | 23.3% | 8.1 GiB |
-| torch | **SDPA** | **20.163** | 91.1 | 38.1% | 6.3 GiB |
-| torch | SDPA + `compile` | **21.259** | 96.1 | **40.2%** | 6.1 GiB |
+| **burn-cuda** (autotune) | 19.618 | 1.00× | **8.849** | 1.00× | 16.7% |
+| **burn-tch** (ATen kernels) | 22.624 | 1.15× | **9.151** | **1.03×** | 17.3% |
+| torch, naive attention | 47.241 | 2.41× | 12.352 | 1.40× | 23.3% |
+| torch, SDPA | 58.264 | 2.97× | **20.163** | **2.28×** | 38.1% |
+| torch, SDPA + `compile` | — | — | 21.259 | 2.40× | 40.2% |
 
-**Probe geometry, 640 · 16 · 8H:**
+### The gap is not the kernels
 
-| implementation | attention | samples/s | TFLOPS | % of peak | peak mem |
-| --- | --- | --- | --- | --- | --- |
-| Burn, **autotune** | tiled | 9.025 | 9.7 | 4.1% | — |
-| torch | naive | 47.241 | 50.5 | 21.1% | 2.3 GiB |
-| torch | **SDPA** | **58.264** | 62.3 | 26.0% | 1.7 GiB |
+**burn-tch buys 3% at production geometry.** Handing Burn the exact kernels torch
+uses recovers almost nothing, which retires the hypothesis this whole section was
+written to test. cubecl's kernels are competitive with ATen's for this workload —
+that is a real vindication of Burn's compiler, and it is the opposite of what §1's
+"3–8% of peak" implied.
 
-Against the best Burn configuration available today:
+The 2.28× therefore decomposes cleanly, and every factor is measured:
 
-| | 1152 · 24 | 640 · 16 |
+| factor | step | multiplier |
 | --- | --- | --- |
-| torch naive (same attention algorithm) | **2.13×** | **5.23×** |
-| torch SDPA | **3.48×** | **6.46×** |
-| torch SDPA + compile | **3.67×** | — |
+| kernel quality | burn-cuda → burn-tch | **1.03×** |
+| framework overhead | burn-tch → torch naive | **1.35×** |
+| fused attention | torch naive → torch SDPA | **1.63×** |
+| | product | 2.26× (measured total 2.28×) |
 
-**Two thirds of the gap is not attention.** The `naive` arm uses the identical
-algorithm and identical materialized matrix, and is still 2.13× ahead at
-production geometry — so a fused attention kernel in cubecl, the fix
-`PERF-ROUND-1.md` §6 has been pointing at since round 1, would recover roughly a
-third of the difference and leave the rest.
+So the money is in the last two: 1.35× of graph construction, autodiff taping and
+dispatch that torch does more cheaply, and 1.63× of fused attention.
 
-**The gap widens as the model shrinks.** 6.46× at width 640 against 3.48× at
-1152, consistent with §3: Burn's per-kernel overhead dominates at small matmuls.
-Anything narrow — a browser-sized student, an ablation, a probe — is where Burn
-costs the most.
+### The fused-attention 1.63× is reachable without leaving Burn
 
-**Memory is the other half.** torch+SDPA holds the whole accum-8 step in 6.3 GiB
-of 32 GB. `perf/tiled-attention` concluded that a batch dimension needs "a fused
-softmax whose backward recomputes rather than stores"; SDPA is that kernel, and it
-turns the batch ceiling from a research problem into a flag.
+`burn-cubecl` **already has a flash-attention kernel** (`cubek-attention`, with its
+own autotuner, at `kernel/attention/{base,tune}.rs`), and `burn-tch` maps Burn's
+`attention` op to `tch::Tensor::scaled_dot_product_attention`. Neither is
+reachable in training:
 
-**What it reprices.** 3.2M sample-views at accum 8:
+```rust
+// burn-autodiff-0.21.0/src/ops/module.rs:1876
+fn attention(...) -> ... {
+    attention_fallback::<Self>(query, key, value, mask, attn_bias, options)
+}
+```
+
+Unconditional — no `B::has_attention_backward()` escape hatch of the kind
+`ctc_loss` twelve lines below it has. **Burn cannot train with fused attention on
+any backend today, because autodiff throws the kernel away.** (Note also that the
+cubecl kernel falls back whenever `options.scale.is_some()`, which this model
+would set.)
+
+That reframes `perf/tiled-attention`'s conclusion. It said a batch dimension needs
+"a fused softmax whose backward recomputes rather than stores" and treated that as
+a kernel-writing project. The forward kernel already exists in-tree; what is
+missing is a backward for it in `burn-autodiff`. That is a much smaller, more
+targeted piece of work, and it is worth **1.63×** plus whatever memory it frees.
+
+### What it reprices
+
+3.2M sample-views at accum 8:
 
 | trainer | wall clock | cost at $0.335/h |
 | --- | --- | --- |
-| Burn, no autotune | 9.1 d | $73 |
-| Burn, autotune | 6.4 d | $51 |
-| torch SDPA | **1.84 d** | **$15** |
-| torch SDPA + compile | 1.74 d | $14 |
+| burn-cuda, autotune | **4.19 d** | $34 |
+| torch SDPA | **1.84 d** | $15 |
 
 *Caveats.* The torch bench runs on preallocated synthetic tensors with no shard
-decode; round 1 measured shard-load at 0.2–0.3% of wall clock, so this is not
-material, but it is not zero. AdamW over bf16 parameters matches what Burn does
-but is not what anyone should ship — f32 master weights would cost some
-throughput and memory back.
-
-## 6a. CORRECTION — the Burn side of §3, §5 and §6 is measured too low
-
-The 26,513-step probe run reports **22,013 steps in 9000.4 s of `train_seconds`,
-i.e. 19.567 samples/s** at 640×16 with autotune. §5 benchmarked that same shape at
-**9.025**. The live number is **2.17× higher**, and the live number is the honest
-one — it is a single process, a single `train_seconds` reading, and two and a half
-hours long.
-
-**The protocol bug: the warm-up chunk and the timed chunk are separate
-processes.** `--resume` starts a fresh binary, and cubecl's JIT and autotune caches
-live in-process. So the "discarded warm-up" discarded nothing — every timed chunk
-paid full kernel-compilation and autotune-benchmarking cost inside its own
-measured window. That also explains the size of the effect: 2.17× on the autotune
-arms (tuning benchmarks are expensive) against ~1.37× on the baseline arms (JIT
-only).
-
-What this invalidates:
-
-* **§5's absolute figures.** Autotune's true value is larger than +41.6%, because
-  the autotune arm paid tuning cost that the baseline arm did not. The sign and
-  ordering hold; the magnitudes do not.
-* **§6's Burn column, and therefore every torch/Burn ratio.** At 640×16 the
-  corrected ratio is **58.264 / 19.567 = 2.98×**, not 6.46×. The 1152×24 Burn
-  figure has **not** been re-measured — no long single-process run exists at that
-  shape — so 3.48× is unquantified until one does.
-
-**The leak is additive, not multiplicative**, and estimating it the other way is a
-mistake worth naming because a first draft of this section made it. Startup is a
-roughly fixed per-process cost, so it inflates a *fast* config's measured time by a
-larger fraction than a slow one's. Solving `t = S + N/r` at the one shape where
-both numbers are known:
-
-| | 640×16, autotune |
-| --- | --- |
-| timed chunk actually took | 26.59 s |
-| real work in 30 steps (from the 22,013-step run) | 12.27 s |
-| **leaked startup S** | **14.33 s** |
-
-Carrying that same S to 1152×24, whose timed chunk took 41.42 s, gives ~8.86
-samples/s and a torch/Burn ratio of **≈2.28×**:
-
-| assumption for 1152×24 | torch/Burn |
-| --- | --- |
-| as published | 3.48× |
-| constant *multiplier* (wrong model) | 1.60× |
-| **constant *startup* (defensible)** | **≈2.28×** |
-
-So the honest bracket is **2.3–3.5×**, and on the 3.2M-view schedule that is 4.2
-GPU-days against torch's 1.84 — a difference of about **$19**, not the $36 §8
-quotes.
-
-* **§3's width sweep is affected in a known direction.** It ran without autotune,
-  so only JIT warm-up leaked in and S is smaller — but a fixed S penalises the
-  *fast* rows more than the slow ones, so the sweep **understates** the wide/shallow
-  advantage. The true benefit is larger than 1.72×, not smaller.
-
-**Do not quote §5 or §6 until they are re-measured**, either as one long single-
-process run per config, or as a two-point slope across two different step counts
-in fresh processes — `rate = (N₂ − N₁) / (t₂ − t₁)` — which cancels a constant
-per-process startup instead of pretending it was warmed away.
+decode; round 1 measured shard-load at 0.2–0.3% of wall clock. AdamW over bf16
+parameters matches what Burn does but is not what anyone should ship. The
+`burn-tch` build required `LIBTORCH_BYPASS_VERSION_CHECK=1` because `torch-sys
+0.22` pins libtorch 2.9.0 and the box has 2.11.0; it built, ran, and tracked the
+CUDA backend's loss curve to ~0.5% at step 1, but an ABI mismatch that silently
+changes numerics is not fully excluded.
 
 ## 7. What the Rust trainer buys, measured
 
@@ -313,40 +308,44 @@ is how a long run would actually be operated.
 ## 8. So: Rust+CUDA, PyTorch, or TensorRT?
 
 **The trainer is already Rust+CUDA.** What remains in Python is teacher-cache
-generation, the dataset build, and VAE decode. Round 1 §3 measured the teacher at
+generation, the dataset build and VAE decode. Round 1 §3 measured the teacher at
 92% of TGP and listed micro-optimising it under "what not to re-attempt"; here the
 entire 1536-shard cache took about seven minutes. Porting Wan2.1's DiT, VAE and
-umt5 to Burn is a very large rewrite aimed at the part that is not the bottleneck,
-and it would *not* remove the torch dependency from cache generation unless all
-three were ported.
+umt5 to Burn is a very large rewrite aimed at the part that is not the bottleneck.
 
 **TensorRT cannot train.** It builds inference engines; there is no backward pass,
 so it is structurally inapplicable to the multi-GPU-day number that motivates all
-of this. Its plausible targets are teacher-cache generation (92% TGP already) and
-VAE decode (seconds per clip), and it can never touch the deliverable itself,
-which ships to WebGPU where an NVIDIA-native engine cannot go.
+of this. Its plausible targets are teacher-cache generation (already saturated)
+and VAE decode (seconds per clip), and it can never touch the deliverable, which
+ships to WebGPU where an NVIDIA-native engine cannot go.
 
-**So the real choice is Burn-vs-torch for the trainer only**, and it is a genuine
-trade rather than a rout:
+**`burn-tch` is a measured no.** 1.03× at production geometry, for a ~2 GB libtorch
+dependency that destroys the 65 MB binary of §7. Its value was diagnostic, not
+practical: it proves the gap is not cubecl's kernels.
 
-* **Take the free 41.6% now** (§5, done) and re-run §3's width sweep with autotune
-  before spending anything on shape. Both are manifest/JSON edits.
-* **Burn's remaining cost is 3.5× at production geometry and 6.5× at probe
-  geometry** — roughly 4.5 GPU-days and $36 on the deliverable as scoped, plus a
-  multiple on every ablation, which is where the width and depth questions in §4
-  have to be answered.
-* **Rust buys a 65 MB dependency-free trainer**, which is worth real money and
-  real reliability on rented boxes — four of the five machines rented for this
-  session were unusable, and a smaller install surface is fewer ways to fail.
-* **The browser student stays Rust/WGPU regardless.** Nothing in §6 touches it;
-  that is the project's thesis, and TensorRT and torch are both irrelevant to it.
+**A PyTorch trainer is a weaker case than §6's headline suggests.** 2.28× is real,
+and worth 2.35 GPU-days and about $19 on the deliverable as scoped. But 1.63× of
+it is fused attention that Burn already has a kernel for, and giving up the
+dependency-free binary — on rented boxes where four of five machines this session
+were unusable — is not obviously worth the remaining 1.4×.
 
-The measurement that would settle it is **a fused attention kernel in cubecl**.
-It recovers ~1/3 of the gap (§6's naive arm bounds this), and if the remaining
-~2.1× on the dense path is acceptable for the environment win, Burn stays and the
-question is closed. That is a bounded piece of work with a known payoff, and it
-should be scheduled *after* the probe answers whether this pipeline produces video
-at all — a 3.5× speedup on a pipeline that does not work is worth nothing.
+**The recommendation, in order:**
+
+1. **Make `attention`'s backward reachable in Burn.** `burn-cubecl` ships the
+   forward flash kernel with its own autotuner; `burn-autodiff` discards it with an
+   unconditional `attention_fallback`. Worth **1.63×** plus the activation memory
+   that `perf/tiled-attention` could not free, and it keeps everything about the
+   Rust story intact. This is now the single highest-value engineering item.
+2. **Re-run §3 and §5 under the §5a protocol.** Both understate the fast
+   configurations. Cheap, and §3's 1.72× shape win may be larger than recorded.
+3. **Revisit PyTorch only if (1) lands and the residual still hurts.** At that
+   point the question is a 1.4× framework-overhead gap against a 65 MB binary,
+   which is a legitimate judgement call rather than a rout.
+4. **The browser student stays Rust/WGPU regardless.** Nothing here touches it.
+
+And none of this is urgent: [`VALIDATION-ROUND-4.md`](VALIDATION-ROUND-4.md) shows
+the pipeline does not yet produce coherent video. A 2× faster trainer for a model
+that cannot draw is worth nothing.
 
 ## 9. Still the biggest unexploited lever
 
